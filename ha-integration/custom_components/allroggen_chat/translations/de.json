@@ -1,0 +1,33 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Allroggen Support-Chat einrichten",
+        "description": "Backend-Adresse und Integrations-Token eintragen. Beides erhältst du von deinem Dienstleister (Kunden-Detail → Home-Assistant-Chat).",
+        "data": {
+          "backend_url": "Backend-Adresse (z. B. https://ticket.example.com)",
+          "api_token": "Integrations-Token"
+        }
+      },
+      "reauth_confirm": {
+        "title": "Integrations-Token erneuern",
+        "description": "Das Integrations-Token wurde widerrufen oder ist abgelaufen. Bitte ein neues Token eintragen (erhältst du von deinem Dienstleister).",
+        "data": {
+          "api_token": "Neues Integrations-Token"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Backend nicht erreichbar — Adresse prüfen.",
+      "invalid_auth": "Token ungültig, abgelaufen oder widerrufen.",
+      "invalid_url": "Ungültige Backend-Adresse — bitte eine vollständige http(s)-URL angeben.",
+      "unknown": "Unerwarteter Fehler bei der Verbindung."
+    },
+    "abort": {
+      "already_configured": "Die Integration ist bereits eingerichtet.",
+      "single_instance_allowed": "Es kann nur ein Allroggen Support-Chat pro Home-Assistant-Instanz eingerichtet werden.",
+      "reauth_successful": "Das Token wurde aktualisiert.",
+      "reauth_failed": "Die erneute Anmeldung ist fehlgeschlagen — bitte Integration neu einrichten."
+    }
+  }
+}

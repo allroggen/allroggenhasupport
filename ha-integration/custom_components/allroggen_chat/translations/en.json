@@ -1,0 +1,33 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Set up Allroggen support chat",
+        "description": "Enter the backend address and the integration token provided by your service partner.",
+        "data": {
+          "backend_url": "Backend URL (e.g. https://ticket.example.com)",
+          "api_token": "Integration token"
+        }
+      },
+      "reauth_confirm": {
+        "title": "Renew integration token",
+        "description": "The integration token has been revoked or has expired. Please enter a new token (provided by your service partner).",
+        "data": {
+          "api_token": "New integration token"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Cannot connect to the backend — check the address.",
+      "invalid_auth": "Token invalid, expired or revoked.",
+      "invalid_url": "Invalid backend URL — please provide a full http(s) URL.",
+      "unknown": "Unexpected error while connecting."
+    },
+    "abort": {
+      "already_configured": "The integration is already configured.",
+      "single_instance_allowed": "Only one Allroggen support chat can be configured per Home Assistant instance.",
+      "reauth_successful": "The token has been updated.",
+      "reauth_failed": "Re-authentication failed — please set up the integration again."
+    }
+  }
+}

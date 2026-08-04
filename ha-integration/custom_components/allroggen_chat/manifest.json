@@ -1,0 +1,13 @@
+{
+  "domain": "allroggen_chat",
+  "name": "Allroggen Support-Chat",
+  "codeowners": ["@allroggen"],
+  "config_flow": true,
+  "dependencies": ["http", "frontend"],
+  "documentation": "https://github.com/allroggen/allroggen-ha-chat",
+  "integration_type": "service",
+  "iot_class": "cloud_polling",
+  "issue_tracker": "https://github.com/allroggen/allroggen-ha-chat/issues",
+  "requirements": [],
+  "version": "0.1.0"
+}
