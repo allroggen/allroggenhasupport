@@ -4,10 +4,10 @@
   "codeowners": ["@allroggen"],
   "config_flow": true,
   "dependencies": ["http", "frontend"],
-  "documentation": "https://github.com/allroggen/allroggen-ha-chat",
+  "documentation": "https://github.com/allroggen/allroggenhasupport",
   "integration_type": "service",
   "iot_class": "cloud_polling",
-  "issue_tracker": "https://github.com/allroggen/allroggen-ha-chat/issues",
+  "issue_tracker": "https://github.com/allroggen/allroggenhasupport/issues",
   "requirements": [],
   "version": "0.1.0"
 }
