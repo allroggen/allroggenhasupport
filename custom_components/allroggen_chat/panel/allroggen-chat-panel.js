@@ -243,10 +243,10 @@ class AllroggenChatPanel extends HTMLElement {
     const prevInput = this.shadowRoot.getElementById("msg");
     const prevValue = prevInput ? prevInput.value : "";
     const hadFocus = prevInput !== null && this.shadowRoot.activeElement === prevInput;
-    const agentName = this._config && this._config.agentName
-      ? this._config.agentName
+    const agentName = this._config && this._config.assistantName
+      ? this._config.assistantName
       : "Support";
-    const noAgent = this._config && this._config.agentId == null;
+    const noAgent = this._config && !this._config.enabled;
     const quotaExceeded = this._config && this._config.quota && this._config.quota.exceeded;
     const inputDisabled = this._busy || noAgent || quotaExceeded;
 
