@@ -34,8 +34,10 @@ Home Assistant des Kunden arbeiten (Automationen, Dashboards, Helfer).
 ## Token-Kontingent
 
 Der Chat hat je nach Vereinbarung ein monatliches Token-Limit. Den aktuellen
-Verbrauch zeigt der Balken oben im Panel; bei Überschreitung pausiert der
-Chat bis zum Monatswechsel.
+Verbrauch zeigt der Balken oben im Panel — inklusive der bisher angefallenen
+Monatskosten in Euro; bei Überschreitung pausiert der Chat bis zum
+Monatswechsel. Zusätzlich zeigt eine dezente Zeile unter der Werkzeugleiste
+die Token- und Kostensumme der gerade geöffneten Unterhaltung.
 
 ## Fehlerbehebung
 
@@ -60,10 +62,17 @@ Architektur-Grundprinzipien:
 - `proxy.py` leitet `/api/allroggen_chat/*` mit `X-Customer-Token` an
   `<backend>/api/customer-chat/*` weiter — Token bleibt serverseitig, kein
   CORS-Problem. Bei 401 vom Backend startet die Integration automatisch den
-  Reauth-Flow.
+  Reauth-Flow. Der Pfad `/stream` (SSE) wird nicht gepuffert, sondern Chunk
+  für Chunk durchgereicht.
 - `panel/allroggen-chat-panel.js` ist eine dependency-freie Webcomponent,
-  die per `fetch` mit dem HA-Access-Token gegen die Proxy-View arbeitet und
-  nach dem Senden alle 3 s pollt.
+  die per `fetch` mit dem HA-Access-Token gegen die Proxy-View arbeitet.
+  Realtime läuft über **SSE (Token-Streaming)**: Das Panel hält einen
+  persistenten Stream auf `/stream` (EventSource kann keinen
+  Authorization-Header senden, daher fetch-basiertes Frame-Parsing) und
+  rendert Antwort-Token live in eine Entwurfs-Blase. Backends ohne
+  Stream-Endpoint (404) oder Stream-Fehler fallen automatisch auf Polling
+  zurück (alle 3 s nach dem Senden, 5 min Timeout); der Stream wird mit
+  Backoff (5 s → max. 60 s) erneut versucht.
 
 ### Tests
 

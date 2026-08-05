@@ -12,6 +12,7 @@ from custom_components.allroggen_chat.const import DOMAIN, PROXY_URL_BASE
 from .conftest import API_TOKEN, BACKEND_URL
 
 CONFIG_BACKEND_URL = URL(f"{BACKEND_URL}/api/customer-chat/config")
+STREAM_BACKEND_URL = URL(f"{BACKEND_URL}/api/customer-chat/stream")
 
 # aioresponses patches every aiohttp session — let the test client's calls to
 # the local HA test server pass through untouched.
@@ -64,6 +65,45 @@ async def test_proxy_post_messages_forwards_body(
         call = m.requests[("POST", messages_url)][0]
         assert b"Hallo" in call.kwargs["data"]
         assert call.kwargs["headers"]["Content-Type"] == "application/json"
+
+
+async def test_proxy_stream_relays_sse(hass, hass_client, mock_config_entry) -> None:
+    """The SSE endpoint is streamed through, not buffered like a JSON call."""
+    await _setup(hass, mock_config_entry)
+    body = (
+        b": connected\n\n"
+        b'event: assistant.delta\ndata: {"conversationId":12,"delta":"Hallo"}\n\n'
+        b": ping\n\n"
+    )
+    with _mock_backend() as m:
+        m.get(
+            str(STREAM_BACKEND_URL),
+            status=200,
+            body=body,
+            content_type="text/event-stream",
+        )
+        client = await hass_client()
+        resp = await client.get(f"{PROXY_URL_BASE}/stream")
+
+        assert resp.status == 200
+        assert resp.content_type == "text/event-stream"
+        assert resp.headers["Cache-Control"] == "no-cache"
+        assert await resp.read() == body
+        call = m.requests[("GET", STREAM_BACKEND_URL)][0]
+        assert call.kwargs["headers"]["X-Customer-Token"] == API_TOKEN
+
+
+async def test_proxy_stream_404_passes_through(
+    hass, hass_client, mock_config_entry
+) -> None:
+    """An old backend without /stream answers 404 — the panel falls back to polling."""
+    await _setup(hass, mock_config_entry)
+    with _mock_backend() as m:
+        m.get(str(STREAM_BACKEND_URL), status=404, payload={"error": "not_found"})
+        client = await hass_client()
+        resp = await client.get(f"{PROXY_URL_BASE}/stream")
+
+        assert resp.status == 404
 
 
 async def test_proxy_backend_unreachable_returns_502(

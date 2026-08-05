@@ -19,3 +19,7 @@ PANEL_ICON = "mdi:robot-happy-outline"
 # Backend timeouts (seconds)
 TIMEOUT_DEFAULT = 15
 TIMEOUT_SEND = 60
+# SSE stream: no total timeout (long-lived); the backend heartbeats every 15 s,
+# so a read timeout well above that keeps dead connections detectable.
+TIMEOUT_STREAM_CONNECT = 15
+TIMEOUT_STREAM_READ = 90

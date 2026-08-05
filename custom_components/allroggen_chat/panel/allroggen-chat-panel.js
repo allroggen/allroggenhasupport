@@ -6,13 +6,18 @@
  * never reaches the browser; HA's own session (access token) authenticates
  * the panel against the proxy.
  *
- * Realtime = polling: after sending, the conversation is refetched every 3 s
- * until a new Assistant/Error message appears (5 min timeout).
+ * Realtime = SSE: a persistent fetch stream on /stream delivers assistant
+ * deltas/messages/state/usage (EventSource can't send the Authorization
+ * header, so frames are parsed manually). If the backend is too old (404) or
+ * the stream fails, the panel falls back to polling every 3 s after sending
+ * (5 min timeout) and retries the stream with backoff.
  */
 
 const API_BASE = "/api/allroggen_chat";
 const POLL_INTERVAL_MS = 3000;
 const POLL_TIMEOUT_MS = 5 * 60 * 1000;
+const SSE_BACKOFF_START_MS = 5000;
+const SSE_BACKOFF_MAX_MS = 60000;
 
 class AllroggenChatPanel extends HTMLElement {
   constructor() {
@@ -24,6 +29,12 @@ class AllroggenChatPanel extends HTMLElement {
     this._busy = false;
     this._error = null;
     this._pollTimer = null;
+    this._draft = ""; // streamed assistant text, not yet persisted
+    this._mounted = true;
+    this._sseOk = false; // stream usable; false → polling fallback on send
+    this._sseAbort = null; // AbortController for the current stream fetch
+    this._sseBackoff = SSE_BACKOFF_START_MS;
+    this._sseReconnectTimer = null;
   }
 
   set hass(hass) {
@@ -33,7 +44,16 @@ class AllroggenChatPanel extends HTMLElement {
   }
 
   disconnectedCallback() {
+    this._mounted = false;
     this._stopPolling();
+    if (this._sseReconnectTimer) {
+      clearTimeout(this._sseReconnectTimer);
+      this._sseReconnectTimer = null;
+    }
+    if (this._sseAbort) {
+      this._sseAbort.abort();
+      this._sseAbort = null;
+    }
   }
 
   async _init() {
@@ -48,6 +68,7 @@ class AllroggenChatPanel extends HTMLElement {
       this._error = this._describeError(err);
     }
     this._render();
+    this._connectStream(); // fire and forget — reconnects itself
   }
 
   // ---- API helper ----------------------------------------------------------
@@ -79,9 +100,158 @@ class AllroggenChatPanel extends HTMLElement {
     return "Verbindungsfehler. Bitte Seite neu laden.";
   }
 
+  // ---- SSE stream ----------------------------------------------------------
+
+  async _connectStream() {
+    if (!this._mounted) return;
+    const abort = new AbortController();
+    this._sseAbort = abort;
+    try {
+      const resp = await fetch(`${API_BASE}/stream`, {
+        headers: {
+          Authorization: `Bearer ${this._hass.auth.data.access_token}`,
+        },
+        signal: abort.signal,
+      });
+      if (!resp.ok || !resp.body) {
+        // 404 = old backend without the stream endpoint → polling fallback.
+        throw { status: resp.status };
+      }
+      this._sseOk = true;
+      this._sseBackoff = SSE_BACKOFF_START_MS;
+      await this._readStream(resp.body);
+      throw { status: 0 }; // stream ended cleanly → reconnect below
+    } catch (err) {
+      if (!this._mounted || abort.signal.aborted) return;
+      this._sseOk = false;
+      // 404 = old backend without the stream endpoint: stay on the polling
+      // fallback, but keep retrying (backoff max 60 s) so an upgraded
+      // backend is picked up without a page reload.
+      this._scheduleReconnect();
+    }
+  }
+
+  _scheduleReconnect() {
+    if (!this._mounted || this._sseReconnectTimer) return;
+    this._sseReconnectTimer = setTimeout(() => {
+      this._sseReconnectTimer = null;
+      this._connectStream();
+    }, this._sseBackoff);
+    this._sseBackoff = Math.min(this._sseBackoff * 2, SSE_BACKOFF_MAX_MS);
+  }
+
+  async _readStream(body) {
+    const reader = body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    try {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) return;
+        buffer += decoder.decode(value, { stream: true });
+        let idx;
+        while ((idx = buffer.indexOf("\n\n")) >= 0) {
+          const frame = buffer.slice(0, idx);
+          buffer = buffer.slice(idx + 2);
+          this._handleSseFrame(frame);
+        }
+      }
+    } finally {
+      try { reader.cancel(); } catch (_) { /* already done */ }
+    }
+  }
+
+  _handleSseFrame(frame) {
+    let event = "message";
+    const dataLines = [];
+    for (const line of frame.split("\n")) {
+      if (!line || line.startsWith(":")) continue; // heartbeats / comments
+      if (line.startsWith("event:")) event = line.slice(6).trim();
+      else if (line.startsWith("data:")) dataLines.push(line.slice(5).replace(/^ /, ""));
+    }
+    if (dataLines.length === 0) return;
+    let payload;
+    try {
+      payload = JSON.parse(dataLines.join("\n"));
+    } catch (_) {
+      return; // malformed frame — drop it, keep the stream
+    }
+    this._handleSseEvent(event, payload);
+  }
+
+  _handleSseEvent(event, payload) {
+    if (!payload || !this._conversation) return;
+    if (payload.conversationId !== this._conversation.id) return;
+    switch (event) {
+      case "assistant.delta":
+        this._draft += payload.delta || "";
+        this._updateDraftBubble();
+        break;
+      case "assistant.message":
+        if (payload.message) this._conversation.messages.push(payload.message);
+        this._draft = "";
+        this._render();
+        this._scrollDown();
+        break;
+      case "assistant.state":
+        if (payload.state === "done") {
+          this._busy = false;
+          this._draft = "";
+          this._render();
+          this._scrollDown();
+          // Quota/costs and the conversation list moved — refresh both.
+          this._api("GET", "config")
+            .then((c) => { this._config = c; this._render(); })
+            .catch(() => {});
+          this._api("GET", "conversations")
+            .then((l) => { this._conversations = l; this._render(); })
+            .catch(() => {});
+        } else if (payload.state === "error") {
+          this._busy = false;
+          this._draft = "";
+          this._error = payload.error || "Der Agent konnte die Nachricht nicht verarbeiten.";
+          this._render();
+        }
+        break;
+      case "assistant.usage":
+        if (payload.usage) {
+          this._conversation.usage = payload.usage;
+          this._updateUsageLine();
+        }
+        break;
+    }
+  }
+
+  /** Update the streaming draft bubble in place — no full re-render per token. */
+  _updateDraftBubble() {
+    const messages = this.shadowRoot && this.shadowRoot.getElementById("messages");
+    if (!messages) return;
+    let el = this.shadowRoot.getElementById("draft-bubble");
+    if (!el) {
+      const busy = messages.querySelector(".busy");
+      if (busy) busy.remove();
+      el = document.createElement("div");
+      el.className = "msg assistant";
+      el.id = "draft-bubble";
+      el.innerHTML = '<div class="bubble draft"></div>';
+      messages.appendChild(el);
+    }
+    el.firstElementChild.innerHTML = this._md(this._draft);
+    this._scrollDown();
+  }
+
+  /** Live-update the per-conversation cost line (usage events are rare). */
+  _updateUsageLine() {
+    const el = this.shadowRoot && this.shadowRoot.getElementById("conv-usage");
+    const u = this._conversation && this._conversation.usage;
+    if (!el || !u) return; // the state=done re-render adds the line if missing
+    el.textContent = this._usageText(u);
+  }
+
   // ---- Conversations -------------------------------------------------------
 
   async _openConversation(id) {
+    this._draft = "";
     this._conversation = await this._api("GET", `conversations/${id}`);
     this._render();
     this._scrollDown();
@@ -89,6 +259,7 @@ class AllroggenChatPanel extends HTMLElement {
 
   async _newConversation() {
     this._stopPolling();
+    this._draft = "";
     this._conversation = null;
     this._render();
   }
@@ -104,6 +275,7 @@ class AllroggenChatPanel extends HTMLElement {
       this._render();
       return;
     }
+    this._draft = "";
     this._conversations = this._conversations.filter((c) => c.id !== id);
     this._conversation = null;
     if (this._conversations.length > 0) {
@@ -112,7 +284,7 @@ class AllroggenChatPanel extends HTMLElement {
     this._render();
   }
 
-  // ---- Sending + polling ---------------------------------------------------
+  // ---- Sending + polling fallback -------------------------------------------
 
   async _send() {
     const input = this.shadowRoot.getElementById("msg");
@@ -121,6 +293,7 @@ class AllroggenChatPanel extends HTMLElement {
 
     this._busy = true;
     this._error = null;
+    this._draft = "";
     input.value = "";
     this._render();
 
@@ -132,7 +305,13 @@ class AllroggenChatPanel extends HTMLElement {
       await this._openConversation(result.conversationId);
       // Refresh the conversation list (title / ordering may have changed).
       this._conversations = await this._api("GET", "conversations");
-      this._startPolling(result.conversationId, result.userMessageId);
+      if (this._sseOk) {
+        // The answer arrives via assistant.delta/message/state events —
+        // no polling, no timeout needed. _busy clears on state=done/error.
+        this._render();
+      } else {
+        this._startPolling(result.conversationId, result.userMessageId);
+      }
     } catch (err) {
       this._busy = false;
       if (err && err.status === 429 && err.body && err.body.quota) {
@@ -232,6 +411,21 @@ class AllroggenChatPanel extends HTMLElement {
     return `<div class="model-info">⚙ ${parts.join(" · ")}</div>`;
   }
 
+  _usageText(u) {
+    const tokens = Number(u.totalTokens).toLocaleString("de-DE");
+    const cost = Number(u.cost).toLocaleString("de-DE", {
+      style: "currency",
+      currency: u.currency || "EUR",
+    });
+    return `Diese Unterhaltung: ${tokens} Tokens · ${cost}`;
+  }
+
+  _usageHtml() {
+    const u = this._conversation && this._conversation.usage;
+    if (!u) return "";
+    return `<div class="conv-usage" id="conv-usage">${this._esc(this._usageText(u))}</div>`;
+  }
+
   _messagesHtml() {
     if (this._conversation === null) {
       return `<div class="empty">Neue Unterhaltung — schreib einfach unten deine Frage. 🙂</div>`;
@@ -296,6 +490,7 @@ class AllroggenChatPanel extends HTMLElement {
         .msg { display: flex; }
         .msg.user { justify-content: flex-end; }
         .bubble { max-width: 75%; padding: 10px 14px; border-radius: 14px; background: var(--secondary-background-color, #eee); color: var(--primary-text-color, #222); line-height: 1.45; word-wrap: break-word; }
+        .bubble.draft { opacity: 0.85; }
         .msg.user .bubble { background: var(--primary-color, #03a9f4); color: #fff; }
         .bubble.error { background: #ffebee; color: #b71c1c; }
         .bubble code { font-family: monospace; background: rgba(0,0,0,0.08); padding: 1px 4px; border-radius: 4px; }
@@ -307,6 +502,7 @@ class AllroggenChatPanel extends HTMLElement {
         .busy { font-size: 13px; color: var(--secondary-text-color, #666); padding: 4px 8px; }
         .model-info { font-size: 12px; color: var(--secondary-text-color, #666); margin: -4px 0 8px; }
         .quota .cost { font-weight: 600; }
+        .conv-usage { font-size: 12px; color: var(--secondary-text-color, #666); margin: -4px 0 8px; }
       </style>
       <div class="wrap">
         <div class="header">
@@ -325,9 +521,11 @@ class AllroggenChatPanel extends HTMLElement {
           <button class="secondary" id="new">Neu</button>
           ${this._conversation ? `<button class="secondary" id="del">Löschen</button>` : ""}
         </div>
+        ${this._usageHtml()}
         <div class="messages" id="messages">
           ${this._messagesHtml()}
-          ${this._busy ? `<div class="busy">Der Agent arbeitet…</div>` : ""}
+          ${this._draft ? `<div class="msg assistant" id="draft-bubble"><div class="bubble draft">${this._md(this._draft)}</div></div>` : ""}
+          ${this._busy && !this._draft ? `<div class="busy">Der Agent arbeitet…</div>` : ""}
         </div>
         <div class="composer">
           <input id="msg" placeholder="Nachricht schreiben…" ${inputDisabled ? "disabled" : ""} />
