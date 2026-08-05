@@ -31,13 +31,15 @@ Home Assistant des Kunden arbeiten (Automationen, Dashboards, Helfer).
 2. Backend-Adresse (z. B. `https://ticket.example.com`) und Token eintragen
 3. In der Seitenleiste erscheint **Allroggen Support** — fertig.
 
-## Token-Kontingent
+## Chat-Budget
 
-Der Chat hat je nach Vereinbarung ein monatliches Token-Limit. Den aktuellen
-Verbrauch zeigt der Balken oben im Panel — inklusive der bisher angefallenen
-Monatskosten in Euro; bei Überschreitung pausiert der Chat bis zum
-Monatswechsel. Zusätzlich zeigt eine dezente Zeile unter der Werkzeugleiste
-die Token- und Kostensumme der gerade geöffneten Unterhaltung.
+Der Chat hat je nach Vereinbarung ein monatliches Kostenlimit in Euro. Der
+Balken oben im Panel zeigt, wie viel Budget bereits verbraucht wurde, wie
+hoch das Limit ist und wie viel noch übrig ist; bei Überschreitung pausiert
+der Chat bis zum Monatswechsel. Ohne festes Limit wird nur der bisherige
+Monatsverbrauch in Euro angezeigt. Zusätzlich zeigt eine dezente Zeile unter
+der Werkzeugleiste die Token- und Kostensumme der gerade geöffneten
+Unterhaltung.
 
 ## Fehlerbehebung
 

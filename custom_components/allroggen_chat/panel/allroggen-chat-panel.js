@@ -316,8 +316,13 @@ class AllroggenChatPanel extends HTMLElement {
       this._busy = false;
       if (err && err.status === 429 && err.body && err.body.quota) {
         const q = err.body.quota;
+        const eur = (v) => Number(v).toLocaleString("de-DE", { style: "currency", currency: "EUR" });
         const reset = new Date(q.resetsAt).toLocaleDateString("de-DE");
-        this._error = `Dein monatliches Token-Kontingent ist erschöpft (${q.used.toLocaleString("de-DE")} von ${q.limit.toLocaleString("de-DE")} Tokens). Es wird am ${reset} zurückgesetzt.`;
+        const used = q.usedCost != null ? eur(q.usedCost) : null;
+        const detail = q.costLimit != null
+          ? ` (${used || eur(0)} von ${eur(q.costLimit)})`
+          : used ? ` (${used})` : "";
+        this._error = `Dein monatliches Chat-Budget ist aufgebraucht${detail}. Es wird am ${reset} zurückgesetzt.`;
         if (this._config) this._config.quota = q;
       } else {
         this._error = this._describeError(err);
@@ -383,20 +388,21 @@ class AllroggenChatPanel extends HTMLElement {
   _quotaHtml() {
     const q = this._config && this._config.quota;
     if (!q) return "";
-    const cost = q.usedCost != null
-      ? `<span class="cost" title="Kosten diesen Monat">${Number(q.usedCost).toLocaleString("de-DE", { style: "currency", currency: "EUR" })}</span>`
-      : "";
-    if (q.limit == null) {
-      return cost ? `<div class="quota">${cost}</div>` : "";
+    const eur = (v) => Number(v).toLocaleString("de-DE", { style: "currency", currency: "EUR" });
+    const used = q.usedCost != null ? eur(q.usedCost) : null;
+    if (q.costLimit == null) {
+      return used ? `<div class="quota"><span class="cost" title="Kosten diesen Monat">${used} diesen Monat</span></div>` : "";
     }
-    const pct = Math.min(100, Math.round((q.used / q.limit) * 100));
+    const pct = q.costLimit > 0
+      ? Math.min(100, Math.round((Number(q.usedCost || 0) / Number(q.costLimit)) * 100))
+      : 100;
     const cls = q.exceeded ? "quota-exceeded" : q.warning ? "quota-warning" : "";
     const reset = new Date(q.resetsAt).toLocaleDateString("de-DE");
+    const remaining = q.remainingCost != null ? ` · ${eur(q.remainingCost)} übrig` : "";
     return `
       <div class="quota ${cls}" title="Reset am ${reset}">
         <div class="quota-bar"><div class="quota-fill" style="width:${pct}%"></div></div>
-        <span>${q.used.toLocaleString("de-DE")} / ${q.limit.toLocaleString("de-DE")} Tokens</span>
-        ${cost}
+        <span class="cost">${used || eur(0)} von ${eur(q.costLimit)}${remaining}</span>
       </div>`;
   }
 
@@ -512,7 +518,7 @@ class AllroggenChatPanel extends HTMLElement {
         ${this._modelHtml()}
         ${this._error ? `<div class="error-banner">${this._esc(this._error)}</div>` : ""}
         ${noAgent ? `<div class="notice">Der Chat ist für deinen Zugang noch nicht eingerichtet. Bitte kontaktiere deinen Dienstleister.</div>` : ""}
-        ${quotaExceeded ? `<div class="notice">Monatliches Token-Kontingent erschöpft — der Chat ist bis zum Reset pausiert.</div>` : ""}
+        ${quotaExceeded ? `<div class="notice">Monatliches Chat-Budget erschöpft — der Chat ist bis zum Reset pausiert.</div>` : ""}
         <div class="toolbar">
           <select id="conv">
             ${this._conversation === null ? `<option value="" selected>— Neue Unterhaltung —</option>` : ""}
