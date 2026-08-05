@@ -203,7 +203,13 @@ class AllroggenChatPanel extends HTMLElement {
 
   _quotaHtml() {
     const q = this._config && this._config.quota;
-    if (!q || q.limit == null) return "";
+    if (!q) return "";
+    const cost = q.usedCost != null
+      ? `<span class="cost" title="Kosten diesen Monat">${Number(q.usedCost).toLocaleString("de-DE", { style: "currency", currency: "EUR" })}</span>`
+      : "";
+    if (q.limit == null) {
+      return cost ? `<div class="quota">${cost}</div>` : "";
+    }
     const pct = Math.min(100, Math.round((q.used / q.limit) * 100));
     const cls = q.exceeded ? "quota-exceeded" : q.warning ? "quota-warning" : "";
     const reset = new Date(q.resetsAt).toLocaleDateString("de-DE");
@@ -211,7 +217,19 @@ class AllroggenChatPanel extends HTMLElement {
       <div class="quota ${cls}" title="Reset am ${reset}">
         <div class="quota-bar"><div class="quota-fill" style="width:${pct}%"></div></div>
         <span>${q.used.toLocaleString("de-DE")} / ${q.limit.toLocaleString("de-DE")} Tokens</span>
+        ${cost}
       </div>`;
+  }
+
+  _modelHtml() {
+    const c = this._config;
+    if (!c || !c.enabled || !c.modelName) return "";
+    const parts = [this._esc(c.modelName)];
+    if (c.providerName) parts[0] = `${this._esc(c.providerName)} · ${parts[0]}`;
+    if (c.contextWindowTokens) {
+      parts.push(`Kontext: ${Number(c.contextWindowTokens).toLocaleString("de-DE")} Token`);
+    }
+    return `<div class="model-info">⚙ ${parts.join(" · ")}</div>`;
   }
 
   _messagesHtml() {
@@ -287,12 +305,15 @@ class AllroggenChatPanel extends HTMLElement {
         .composer { display: flex; gap: 8px; padding-top: 8px; border-top: 1px solid var(--divider-color, #ddd); }
         .composer input { flex: 1; padding: 12px; border-radius: 8px; border: 1px solid var(--divider-color, #ddd); font-size: 14px; background: var(--card-background-color, #fff); color: var(--primary-text-color, #222); }
         .busy { font-size: 13px; color: var(--secondary-text-color, #666); padding: 4px 8px; }
+        .model-info { font-size: 12px; color: var(--secondary-text-color, #666); margin: -4px 0 8px; }
+        .quota .cost { font-weight: 600; }
       </style>
       <div class="wrap">
         <div class="header">
           <h1>💬 ${this._esc(agentName)}</h1>
           ${this._quotaHtml()}
         </div>
+        ${this._modelHtml()}
         ${this._error ? `<div class="error-banner">${this._esc(this._error)}</div>` : ""}
         ${noAgent ? `<div class="notice">Der Chat ist für deinen Zugang noch nicht eingerichtet. Bitte kontaktiere deinen Dienstleister.</div>` : ""}
         ${quotaExceeded ? `<div class="notice">Monatliches Token-Kontingent erschöpft — der Chat ist bis zum Reset pausiert.</div>` : ""}
