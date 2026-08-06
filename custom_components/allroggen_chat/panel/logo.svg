@@ -1,0 +1,26 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#35B6F6"/>
+      <stop offset="1" stop-color="#0277BD"/>
+    </linearGradient>
+  </defs>
+
+  <!-- App-Icon-Grundflaeche -->
+  <rect x="8" y="8" width="496" height="496" rx="112" fill="url(#bg)"/>
+
+  <!-- Antenne -->
+  <line x1="256" y1="152" x2="256" y2="104" stroke="#FFFFFF" stroke-width="14" stroke-linecap="round"/>
+  <circle cx="256" cy="92" r="16" fill="#FFFFFF"/>
+
+  <!-- Chat-Bubble (Koerper + Sprechblase-Schwanz) -->
+  <rect x="112" y="150" width="288" height="170" rx="42" fill="#FFFFFF"/>
+  <path d="M148 298 L148 382 L252 306 Z" fill="#FFFFFF"/>
+
+  <!-- Roboter-Gesicht -->
+  <circle cx="196" cy="225" r="20" fill="#0277BD"/>
+  <circle cx="316" cy="225" r="20" fill="#0277BD"/>
+  <circle cx="190" cy="219" r="6" fill="#FFFFFF"/>
+  <circle cx="310" cy="219" r="6" fill="#FFFFFF"/>
+  <path d="M212 268 Q256 300 300 268" stroke="#0277BD" stroke-width="14" fill="none" stroke-linecap="round"/>
+</svg>

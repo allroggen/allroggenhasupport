@@ -902,7 +902,8 @@ class AllroggenChatPanel extends HTMLElement {
 
         /* Header */
         .header { display: flex; align-items: center; gap: 12px; }
-        .avatar { width: 42px; height: 42px; border-radius: 50%; flex-shrink: 0; display: flex; align-items: center; justify-content: center; font-size: 18px; font-weight: 600; color: #fff; background: var(--primary-color, #03a9f4); background: linear-gradient(135deg, var(--primary-color, #03a9f4), var(--accent-color, #5c6bc0)); }
+        .avatar { width: 42px; height: 42px; border-radius: 50%; flex-shrink: 0; display: flex; align-items: center; justify-content: center; font-size: 18px; font-weight: 600; color: #fff; background: var(--primary-color, #03a9f4); background: linear-gradient(135deg, var(--primary-color, #03a9f4), var(--accent-color, #5c6bc0)); overflow: hidden; }
+        .avatar img { width: 100%; height: 100%; object-fit: cover; display: block; }
         .header-text { flex: 1; min-width: 0; }
         .header h1 { font-size: 18px; margin: 0; font-weight: 600; }
         .quota { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--secondary-text-color, #666); margin-top: 4px; }
@@ -1006,7 +1007,7 @@ class AllroggenChatPanel extends HTMLElement {
       <div class="${wrapClasses}">
         <div class="header">
           <button type="button" class="icon-btn" id="conv-toggle" title="Unterhaltungen ein-/ausblenden">☰</button>
-          <div class="avatar">${this._esc(agentName.trim().charAt(0).toUpperCase() || "?")}</div>
+          <div class="avatar"><img src="/allroggen_chat_static/logo.svg" alt="" onerror="this.outerHTML='${this._esc(agentName.trim().charAt(0).toUpperCase() || "?")}'"></div>
           <div class="header-text">
             <h1>${this._esc(agentName)}</h1>
             ${this._quotaHtml()}
