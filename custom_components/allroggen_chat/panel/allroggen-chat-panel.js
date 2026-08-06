@@ -898,7 +898,7 @@ class AllroggenChatPanel extends HTMLElement {
     this.shadowRoot.innerHTML = `
       <style>
         :host { display: block; height: calc(100vh - var(--header-height, 64px)); height: calc(100dvh - var(--header-height, 64px)); }
-        .wrap { display: flex; flex-direction: column; height: 100%; max-height: 100%; overflow: hidden; max-width: 960px; margin: 0 auto; padding: 16px 16px 12px; box-sizing: border-box; gap: 8px; }
+        .wrap { display: flex; flex-direction: column; height: 100%; max-height: 100%; overflow: hidden; padding: 16px 16px 12px; box-sizing: border-box; gap: 8px; }
 
         /* Header */
         .header { display: flex; align-items: center; gap: 12px; }
