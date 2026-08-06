@@ -47,6 +47,15 @@ class AllroggenChatPanel extends HTMLElement {
     this._nearBottom = true; // Nutzer ist (fast) am unteren Ende der Nachrichten
     this._unseenBelow = false; // neue Inhalte unterhalb der sichtbaren Position
     this._lastScrollTop = 0; // Unterscheidung Nutzer-Scroll vs. Content-Wachstum
+    this._narrow = false; // schmaler Container → Sidebar als Overlay-Drawer
+    this._drawerOpen = false; // Drawer im narrow-Modus
+    this._resizeObserver = null;
+    try {
+      this._sidebarCollapsed =
+        localStorage.getItem("allroggenChat.sidebarCollapsed") === "1";
+    } catch (_) {
+      this._sidebarCollapsed = false;
+    }
   }
 
   set hass(hass) {
@@ -63,6 +72,10 @@ class AllroggenChatPanel extends HTMLElement {
     for (const url of this._attachmentUrls.values()) URL.revokeObjectURL(url);
     this._attachmentUrls.clear();
     this._attachmentPromises.clear();
+    if (this._resizeObserver) {
+      this._resizeObserver.disconnect();
+      this._resizeObserver = null;
+    }
     if (this._sseReconnectTimer) {
       clearTimeout(this._sseReconnectTimer);
       this._sseReconnectTimer = null;
@@ -75,6 +88,18 @@ class AllroggenChatPanel extends HTMLElement {
 
   async _init() {
     this._render();
+    // Unter ~640 px Container-Breite wird die Sidebar zum Overlay-Drawer.
+    if (typeof ResizeObserver !== "undefined") {
+      this._resizeObserver = new ResizeObserver((entries) => {
+        const narrow = entries[0].contentRect.width < 640;
+        if (narrow !== this._narrow) {
+          this._narrow = narrow;
+          if (narrow) this._drawerOpen = false; // startet eingeklappt
+          this._render();
+        }
+      });
+      this._resizeObserver.observe(this);
+    }
     try {
       this._config = await this._api("GET", "config");
       this._conversations = await this._api("GET", "conversations");
@@ -283,6 +308,7 @@ class AllroggenChatPanel extends HTMLElement {
     this._conversation = null;
     this._nearBottom = true;
     this._unseenBelow = false;
+    this._drawerOpen = false;
     this._render();
   }
 
@@ -666,6 +692,64 @@ class AllroggenChatPanel extends HTMLElement {
     }
   }
 
+  // ---- Sidebar (Unterhaltungsliste) -------------------------------------------
+
+  _toggleSidebar() {
+    if (this._narrow) {
+      this._drawerOpen = !this._drawerOpen;
+    } else {
+      this._sidebarCollapsed = !this._sidebarCollapsed;
+      try {
+        localStorage.setItem(
+          "allroggenChat.sidebarCollapsed",
+          this._sidebarCollapsed ? "1" : "0"
+        );
+      } catch (_) { /* localStorage nicht verfügbar */ }
+    }
+    this._render();
+  }
+
+  _selectConversation(id) {
+    if (this._narrow) this._drawerOpen = false; // Drawer nach Auswahl schließen
+    if (this._conversation && this._conversation.id === id) {
+      this._render();
+      return;
+    }
+    this._openConversation(id);
+  }
+
+  /** Kurzdatum der letzten Aktivität einer Unterhaltung („06.08., 14:32“). */
+  _convDateHtml(c) {
+    if (!c.updatedAt) return "";
+    const d = new Date(c.updatedAt);
+    if (isNaN(d.getTime())) return "";
+    const date = d.toLocaleDateString("de-DE", { day: "2-digit", month: "2-digit" });
+    const time = d.toLocaleTimeString("de-DE", { hour: "2-digit", minute: "2-digit" });
+    return `<div class="conv-date">${date}, ${time}</div>`;
+  }
+
+  _sidebarHtml() {
+    const cards = this._conversations
+      .map((c) => {
+        const active = this._conversation && this._conversation.id === c.id;
+        return `
+          <div class="conv-card ${active ? "active" : ""}" data-conv-id="${c.id}">
+            <div class="conv-title">${this._esc(c.title)}</div>
+            ${this._convDateHtml(c)}
+            ${active ? `<button type="button" class="conv-del" id="del" title="Unterhaltung löschen">✕</button>` : ""}
+          </div>`;
+      })
+      .join("");
+    return `
+      <aside class="sidebar">
+        <button type="button" class="new-btn" id="new">＋ Neue Unterhaltung</button>
+        <div class="conv-list" id="conv-list">
+          ${cards || `<div class="conv-empty">Noch keine Unterhaltungen.</div>`}
+        </div>
+      </aside>
+      <div class="backdrop" id="backdrop"></div>`;
+  }
+
   // ---- Rendering -----------------------------------------------------------
 
   _esc(s) {
@@ -737,6 +821,32 @@ class AllroggenChatPanel extends HTMLElement {
     return `<div class="meta">${t}</div>`;
   }
 
+  /** Label für den Tages-Trenner: „Heute“ / „Gestern“ / Datum. */
+  _dayLabel(d) {
+    const today = new Date();
+    const yesterday = new Date();
+    yesterday.setDate(today.getDate() - 1);
+    if (d.toDateString() === today.toDateString()) return "Heute";
+    if (d.toDateString() === yesterday.toDateString()) return "Gestern";
+    return d.toLocaleDateString("de-DE", { day: "numeric", month: "long", year: "numeric" });
+  }
+
+  _messageHtml(m) {
+    if (m.role === "User") {
+      const img = m.hasAttachment
+        ? `<img class="attachment" data-attachment-id="${m.id}" alt="${this._esc(m.attachmentFileName || "Anhang")}" hidden />`
+        : "";
+      return `<div class="msg user"><div class="bubble">${img}${this._md(m.content)}</div>${this._timeHtml(m)}</div>`;
+    }
+    if (m.role === "Tool") {
+      return `<div class="msg tool">⚙️ ${this._esc(m.content).slice(0, 120)}</div>`;
+    }
+    if (m.role === "Error") {
+      return `<div class="msg assistant"><div class="bubble error">⚠️ ${this._md(m.content)}</div>${this._timeHtml(m)}</div>`;
+    }
+    return `<div class="msg assistant"><div class="bubble">${this._md(m.content)}</div>${this._timeHtml(m)}</div>`;
+  }
+
   _messagesHtml() {
     if (this._conversation === null) {
       return `<div class="empty"><div class="empty-icon">💬</div>Neue Unterhaltung — schreib einfach unten deine Frage.</div>`;
@@ -744,23 +854,19 @@ class AllroggenChatPanel extends HTMLElement {
     if (this._conversation.messages.length === 0) {
       return `<div class="empty"><div class="empty-icon">⏳</div>Lade…</div>`;
     }
-    return this._conversation.messages
-      .map((m) => {
-        if (m.role === "User") {
-          const img = m.hasAttachment
-            ? `<img class="attachment" data-attachment-id="${m.id}" alt="${this._esc(m.attachmentFileName || "Anhang")}" hidden />`
-            : "";
-          return `<div class="msg user"><div class="bubble">${img}${this._md(m.content)}</div>${this._timeHtml(m)}</div>`;
-        }
-        if (m.role === "Tool") {
-          return `<div class="msg tool">⚙️ ${this._esc(m.content).slice(0, 120)}</div>`;
-        }
-        if (m.role === "Error") {
-          return `<div class="msg assistant"><div class="bubble error">⚠️ ${this._md(m.content)}</div>${this._timeHtml(m)}</div>`;
-        }
-        return `<div class="msg assistant"><div class="bubble">${this._md(m.content)}</div>${this._timeHtml(m)}</div>`;
-      })
-      .join("");
+    // Nach Kalendertag gruppieren, Trenner zwischen den Gruppen.
+    const parts = [];
+    let lastDay = "";
+    for (const m of this._conversation.messages) {
+      const d = new Date(m.sentAt);
+      const dayKey = isNaN(d.getTime()) ? "" : d.toDateString();
+      if (dayKey && dayKey !== lastDay) {
+        parts.push(`<div class="day-sep"><span>${this._dayLabel(d)}</span></div>`);
+        lastDay = dayKey;
+      }
+      parts.push(this._messageHtml(m));
+    }
+    return parts.join("");
   }
 
   _render() {
@@ -772,6 +878,9 @@ class AllroggenChatPanel extends HTMLElement {
     // Scroll-Position merken, wenn der Nutzer weiter oben liest.
     const prevMessages = this.shadowRoot.getElementById("messages");
     const prevScrollTop = prevMessages ? prevMessages.scrollTop : 0;
+    // Scroll-Position der Sidebar-Liste über den Re-Render behalten.
+    const prevConvList = this.shadowRoot.getElementById("conv-list");
+    const prevConvScrollTop = prevConvList ? prevConvList.scrollTop : 0;
     const agentName = this._config && this._config.assistantName
       ? this._config.assistantName
       : "Support";
@@ -779,17 +888,17 @@ class AllroggenChatPanel extends HTMLElement {
     const quotaExceeded = this._config && this._config.quota && this._config.quota.exceeded;
     const inputDisabled = this._busy || noAgent || quotaExceeded;
 
-    const convOptions = this._conversations
-      .map(
-        (c) =>
-          `<option value="${c.id}" ${this._conversation && this._conversation.id === c.id ? "selected" : ""}>${this._esc(c.title)}</option>`
-      )
-      .join("");
+    const wrapClasses = [
+      "wrap",
+      this._narrow ? "narrow" : "",
+      this._narrow && this._drawerOpen ? "drawer-open" : "",
+      !this._narrow && this._sidebarCollapsed ? "sidebar-collapsed" : "",
+    ].filter(Boolean).join(" ");
 
     this.shadowRoot.innerHTML = `
       <style>
-        :host { display: block; height: 100%; }
-        .wrap { display: flex; flex-direction: column; height: 100%; max-width: 720px; margin: 0 auto; padding: 16px 16px 12px; box-sizing: border-box; gap: 8px; }
+        :host { display: block; height: calc(100vh - var(--header-height, 64px)); height: calc(100dvh - var(--header-height, 64px)); }
+        .wrap { display: flex; flex-direction: column; height: 100%; max-height: 100%; overflow: hidden; max-width: 960px; margin: 0 auto; padding: 16px 16px 12px; box-sizing: border-box; gap: 8px; }
 
         /* Header */
         .header { display: flex; align-items: center; gap: 12px; }
@@ -807,17 +916,38 @@ class AllroggenChatPanel extends HTMLElement {
         /* Buttons */
         button { font: inherit; border: none; cursor: pointer; }
         button:disabled { opacity: 0.5; cursor: default; }
-        button:focus-visible, select:focus-visible { outline: 2px solid var(--primary-color, #03a9f4); outline-offset: 1px; }
-        .btn { padding: 8px 14px; border-radius: 10px; background: var(--secondary-background-color, #e0e0e0); color: var(--primary-text-color, #222); font-size: 13px; }
-        .btn:hover:not(:disabled) { filter: brightness(0.96); }
+        button:focus-visible { outline: 2px solid var(--primary-color, #03a9f4); outline-offset: 1px; }
 
-        /* Toolbar */
-        .toolbar { display: flex; gap: 8px; align-items: center; }
-        select { flex: 1; min-width: 0; padding: 8px 10px; border-radius: 10px; border: 1px solid var(--divider-color, #ddd); background: var(--card-background-color, #fff); color: var(--primary-text-color, #222); font-size: 13px; }
+        /* Body: Sidebar + Hauptspalte — nur .messages bzw. .conv-list scrollen */
+        .body { position: relative; flex: 1; min-height: 0; display: flex; gap: 12px; }
+        .main { flex: 1; min-width: 0; min-height: 0; display: flex; flex-direction: column; gap: 8px; }
+        .sidebar { width: 240px; flex-shrink: 0; min-height: 0; display: flex; flex-direction: column; gap: 8px; }
+        .sidebar-collapsed .sidebar { display: none; }
+        .new-btn { padding: 9px 14px; border-radius: 10px; background: var(--primary-color, #03a9f4); color: #fff; font-size: 13px; font-weight: 600; }
+        .new-btn:hover { filter: brightness(1.1); }
+        .conv-list { flex: 1; min-height: 0; overflow-y: auto; display: flex; flex-direction: column; gap: 6px; padding-right: 2px; }
+        .conv-list::-webkit-scrollbar { width: 6px; }
+        .conv-list::-webkit-scrollbar-thumb { background: var(--divider-color, #ccc); border-radius: 3px; }
+        .conv-list::-webkit-scrollbar-track { background: transparent; }
+        .conv-card { position: relative; padding: 10px 12px; border-radius: 12px; border: 1px solid var(--divider-color, #e2e2e2); border-left: 3px solid transparent; background: var(--card-background-color, #fff); cursor: pointer; }
+        .conv-card:hover { background: var(--secondary-background-color, #f3f3f3); }
+        .conv-card.active { border-left-color: var(--primary-color, #03a9f4); background: var(--secondary-background-color, #f3f3f3); }
+        .conv-title { font-size: 13px; font-weight: 500; color: var(--primary-text-color, #222); display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+        .conv-card.active .conv-title { padding-right: 20px; }
+        .conv-date { font-size: 11px; color: var(--secondary-text-color, #888); margin-top: 4px; }
+        .conv-del { position: absolute; top: 6px; right: 6px; width: 22px; height: 22px; border-radius: 50%; background: transparent; color: var(--secondary-text-color, #888); font-size: 11px; display: flex; align-items: center; justify-content: center; }
+        .conv-del:hover { background: #fdecea; color: #b71c1c; }
+        .conv-empty { font-size: 12px; color: var(--secondary-text-color, #888); text-align: center; padding: 16px 8px; }
+        .backdrop { display: none; }
+        .narrow .sidebar { position: absolute; left: 0; top: 0; bottom: 0; z-index: 5; width: 260px; padding: 8px; background: var(--card-background-color, #fff); border-right: 1px solid var(--divider-color, #ddd); box-shadow: 2px 0 12px rgba(0,0,0,0.25); transform: translateX(-110%); transition: transform 0.2s ease; }
+        .narrow.drawer-open .sidebar { transform: none; }
+        .narrow.drawer-open .backdrop { display: block; position: absolute; inset: 0; z-index: 4; background: rgba(0,0,0,0.35); }
 
         /* Nachrichten */
         .messages-wrap { position: relative; flex: 1; min-height: 0; display: flex; }
-        .messages { flex: 1; overflow-y: auto; padding: 12px 6px; display: flex; flex-direction: column; gap: 10px; scroll-behavior: smooth; }
+        .messages { flex: 1; min-height: 0; overflow-y: auto; padding: 12px 6px; display: flex; flex-direction: column; gap: 10px; scroll-behavior: smooth; }
+        .day-sep { display: flex; align-items: center; justify-content: center; margin: 4px 0 0; }
+        .day-sep span { font-size: 11px; color: var(--secondary-text-color, #888); background: var(--secondary-background-color, #eee); padding: 3px 12px; border-radius: 999px; }
         .messages::-webkit-scrollbar { width: 6px; }
         .messages::-webkit-scrollbar-thumb { background: var(--divider-color, #ccc); border-radius: 3px; }
         .messages::-webkit-scrollbar-track { background: transparent; }
@@ -873,8 +1003,9 @@ class AllroggenChatPanel extends HTMLElement {
           .avatar { width: 36px; height: 36px; font-size: 16px; }
         }
       </style>
-      <div class="wrap">
+      <div class="${wrapClasses}">
         <div class="header">
+          <button type="button" class="icon-btn" id="conv-toggle" title="Unterhaltungen ein-/ausblenden">☰</button>
           <div class="avatar">${this._esc(agentName.trim().charAt(0).toUpperCase() || "?")}</div>
           <div class="header-text">
             <h1>${this._esc(agentName)}</h1>
@@ -885,42 +1016,39 @@ class AllroggenChatPanel extends HTMLElement {
         ${this._error ? `<div class="error-banner">${this._esc(this._error)}</div>` : ""}
         ${noAgent ? `<div class="notice">Der Chat ist für deinen Zugang noch nicht eingerichtet. Bitte kontaktiere deinen Dienstleister.</div>` : ""}
         ${quotaExceeded ? `<div class="notice">Monatliches Chat-Budget erschöpft — der Chat ist bis zum Reset pausiert.</div>` : ""}
-        <div class="toolbar">
-          <select id="conv">
-            ${this._conversation === null ? `<option value="" selected>— Neue Unterhaltung —</option>` : ""}
-            ${convOptions}
-          </select>
-          <button type="button" class="btn" id="new">Neu</button>
-          ${this._conversation ? `<button type="button" class="btn" id="del">Löschen</button>` : ""}
-        </div>
-        ${this._usageHtml()}
-        <div class="messages-wrap">
-          <div class="messages" id="messages">
-            ${this._messagesHtml()}
-            ${this._draft ? `<div class="msg assistant" id="draft-bubble"><div class="bubble draft">${this._md(this._draft)}</div></div>` : ""}
-            ${this._busy && !this._draft ? `
-              <div class="msg assistant busy">
-                <div class="bubble typing" title="${this._cancelling ? "Wird abgebrochen…" : "Der Agent arbeitet…"}"><span class="dot"></span><span class="dot"></span><span class="dot"></span></div>
-                ${this._cancelling ? `<div class="meta">Wird abgebrochen…</div>` : ""}
+        <div class="body">
+          ${this._sidebarHtml()}
+          <div class="main">
+            ${this._usageHtml()}
+            <div class="messages-wrap">
+              <div class="messages" id="messages">
+                ${this._messagesHtml()}
+                ${this._draft ? `<div class="msg assistant" id="draft-bubble"><div class="bubble draft">${this._md(this._draft)}</div></div>` : ""}
+                ${this._busy && !this._draft ? `
+                  <div class="msg assistant busy">
+                    <div class="bubble typing" title="${this._cancelling ? "Wird abgebrochen…" : "Der Agent arbeitet…"}"><span class="dot"></span><span class="dot"></span><span class="dot"></span></div>
+                    ${this._cancelling ? `<div class="meta">Wird abgebrochen…</div>` : ""}
+                  </div>` : ""}
+              </div>
+              ${this._unseenBelow ? `<button type="button" class="new-msgs" id="new-msgs">↓ Neue Nachrichten</button>` : ""}
+            </div>
+            ${this._pendingImage ? `
+              <div class="img-preview">
+                <img src="${this._esc(this._pendingImage.previewUrl)}" alt="${this._esc(this._pendingImage.fileName)}" />
+                <span class="file-name">${this._esc(this._pendingImage.fileName)}</span>
+                <button type="button" id="rmimg" title="Bild entfernen">✕</button>
               </div>` : ""}
+            ${this._speechError ? `<div class="speech-error">${this._esc(this._speechError)}</div>` : ""}
+            <div class="composer">
+              <input type="file" id="imgfile" accept="image/*" hidden />
+              <button type="button" class="icon-btn" id="attach" title="Bild anhängen" ${inputDisabled ? "disabled" : ""}>📎</button>
+              ${this._speechSupported() ? `<button type="button" class="icon-btn ${this._recording ? "recording" : ""}" id="mic" title="Spracheingabe" ${inputDisabled ? "disabled" : ""}>🎤</button>` : ""}
+              <input id="msg" placeholder="Nachricht schreiben…" ${inputDisabled ? "disabled" : ""} />
+              ${this._busy && this._conversation
+                ? `<button type="button" class="cancel-btn" id="cancel" ${this._cancelling ? "disabled" : ""}>Abbrechen</button>`
+                : `<button type="button" class="send-btn" id="send" title="Senden" ${inputDisabled ? "disabled" : ""}>➤</button>`}
+            </div>
           </div>
-          ${this._unseenBelow ? `<button type="button" class="new-msgs" id="new-msgs">↓ Neue Nachrichten</button>` : ""}
-        </div>
-        ${this._pendingImage ? `
-          <div class="img-preview">
-            <img src="${this._esc(this._pendingImage.previewUrl)}" alt="${this._esc(this._pendingImage.fileName)}" />
-            <span class="file-name">${this._esc(this._pendingImage.fileName)}</span>
-            <button type="button" id="rmimg" title="Bild entfernen">✕</button>
-          </div>` : ""}
-        ${this._speechError ? `<div class="speech-error">${this._esc(this._speechError)}</div>` : ""}
-        <div class="composer">
-          <input type="file" id="imgfile" accept="image/*" hidden />
-          <button type="button" class="icon-btn" id="attach" title="Bild anhängen" ${inputDisabled ? "disabled" : ""}>📎</button>
-          ${this._speechSupported() ? `<button type="button" class="icon-btn ${this._recording ? "recording" : ""}" id="mic" title="Spracheingabe" ${inputDisabled ? "disabled" : ""}>🎤</button>` : ""}
-          <input id="msg" placeholder="Nachricht schreiben…" ${inputDisabled ? "disabled" : ""} />
-          ${this._busy && this._conversation
-            ? `<button type="button" class="cancel-btn" id="cancel" ${this._cancelling ? "disabled" : ""}>Abbrechen</button>`
-            : `<button type="button" class="send-btn" id="send" title="Senden" ${inputDisabled ? "disabled" : ""}>➤</button>`}
         </div>
       </div>
     `;
@@ -945,12 +1073,20 @@ class AllroggenChatPanel extends HTMLElement {
     msgInput.addEventListener("keydown", (e) => {
       if (e.key === "Enter") this._send();
     });
-    this.shadowRoot.getElementById("conv").addEventListener("change", (e) => {
-      if (e.target.value) this._openConversation(Number(e.target.value));
-    });
+    this.shadowRoot.getElementById("conv-toggle").addEventListener("click", () => this._toggleSidebar());
     this.shadowRoot.getElementById("new").addEventListener("click", () => this._newConversation());
+    for (const card of this.shadowRoot.querySelectorAll(".conv-card[data-conv-id]")) {
+      card.addEventListener("click", () => this._selectConversation(Number(card.dataset.convId)));
+    }
     const del = this.shadowRoot.getElementById("del");
-    if (del) del.addEventListener("click", () => this._deleteConversation());
+    if (del) del.addEventListener("click", (e) => { e.stopPropagation(); this._deleteConversation(); });
+    const backdrop = this.shadowRoot.getElementById("backdrop");
+    backdrop.addEventListener("click", () => {
+      this._drawerOpen = false;
+      this._render();
+    });
+    const convList = this.shadowRoot.getElementById("conv-list");
+    if (prevConvScrollTop > 0) convList.scrollTop = prevConvScrollTop;
     const pill = this.shadowRoot.getElementById("new-msgs");
     if (pill) pill.addEventListener("click", () => this._jumpToLatest());
     const messagesEl = this.shadowRoot.getElementById("messages");

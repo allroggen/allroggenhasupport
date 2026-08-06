@@ -66,9 +66,10 @@ Der Chat hat je nach Vereinbarung ein monatliches Kostenlimit in Euro. Der
 Balken oben im Panel zeigt, wie viel Budget bereits verbraucht wurde, wie
 hoch das Limit ist und wie viel noch übrig ist; bei Überschreitung pausiert
 der Chat bis zum Monatswechsel. Ohne festes Limit wird nur der bisherige
-Monatsverbrauch in Euro angezeigt. Zusätzlich zeigt eine dezente Zeile unter
-der Werkzeugleiste die Token- und Kostensumme der gerade geöffneten
-Unterhaltung.
+Monatsverbrauch in Euro angezeigt. Zusätzlich zeigt eine dezente Zeile über
+der Nachrichtenliste die Token- und Kostensumme der gerade geöffneten
+Unterhaltung. Unterhaltungen lassen sich in der einklappbaren Seitenleiste
+links wechseln, neu anlegen und löschen.
 
 ## 🛠️ Fehlerbehebung
 
