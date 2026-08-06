@@ -35,6 +35,18 @@ class AllroggenChatPanel extends HTMLElement {
     this._sseAbort = null; // AbortController for the current stream fetch
     this._sseBackoff = SSE_BACKOFF_START_MS;
     this._sseReconnectTimer = null;
+    this._pendingImage = null; // { base64, contentType, fileName, previewUrl }
+    this._attachmentUrls = new Map(); // messageId → object URL
+    this._attachmentPromises = new Map(); // messageId → Promise<object URL>
+    this._cancelling = false; // cancel requested, waiting for terminal event
+    this._recognition = null; // active SpeechRecognition instance
+    this._recording = false;
+    this._speechError = null;
+    this._speechBase = ""; // input content before dictation started
+    this._speechFinal = ""; // committed final transcripts of this session
+    this._nearBottom = true; // Nutzer ist (fast) am unteren Ende der Nachrichten
+    this._unseenBelow = false; // neue Inhalte unterhalb der sichtbaren Position
+    this._lastScrollTop = 0; // Unterscheidung Nutzer-Scroll vs. Content-Wachstum
   }
 
   set hass(hass) {
@@ -46,6 +58,11 @@ class AllroggenChatPanel extends HTMLElement {
   disconnectedCallback() {
     this._mounted = false;
     this._stopPolling();
+    this._stopSpeech();
+    this._clearPendingImage();
+    for (const url of this._attachmentUrls.values()) URL.revokeObjectURL(url);
+    this._attachmentUrls.clear();
+    this._attachmentPromises.clear();
     if (this._sseReconnectTimer) {
       clearTimeout(this._sseReconnectTimer);
       this._sseReconnectTimer = null;
@@ -191,14 +208,14 @@ class AllroggenChatPanel extends HTMLElement {
         if (payload.message) this._conversation.messages.push(payload.message);
         this._draft = "";
         this._render();
-        this._scrollDown();
+        this._onNewContent();
         break;
       case "assistant.state":
-        if (payload.state === "done") {
+        if (payload.state === "done" || payload.state === "cancelled") {
           this._busy = false;
+          this._cancelling = false;
           this._draft = "";
           this._render();
-          this._scrollDown();
           // Quota/costs and the conversation list moved — refresh both.
           this._api("GET", "config")
             .then((c) => { this._config = c; this._render(); })
@@ -208,6 +225,7 @@ class AllroggenChatPanel extends HTMLElement {
             .catch(() => {});
         } else if (payload.state === "error") {
           this._busy = false;
+          this._cancelling = false;
           this._draft = "";
           this._error = payload.error || "Der Agent konnte die Nachricht nicht verarbeiten.";
           this._render();
@@ -237,7 +255,7 @@ class AllroggenChatPanel extends HTMLElement {
       messages.appendChild(el);
     }
     el.firstElementChild.innerHTML = this._md(this._draft);
-    this._scrollDown();
+    this._onNewContent();
   }
 
   /** Live-update the per-conversation cost line (usage events are rare). */
@@ -252,15 +270,19 @@ class AllroggenChatPanel extends HTMLElement {
 
   async _openConversation(id) {
     this._draft = "";
+    // Beim Öffnen einer Unterhaltung immer ans Ende springen.
+    this._nearBottom = true;
+    this._unseenBelow = false;
     this._conversation = await this._api("GET", `conversations/${id}`);
     this._render();
-    this._scrollDown();
   }
 
   async _newConversation() {
     this._stopPolling();
     this._draft = "";
     this._conversation = null;
+    this._nearBottom = true;
+    this._unseenBelow = false;
     this._render();
   }
 
@@ -289,19 +311,32 @@ class AllroggenChatPanel extends HTMLElement {
   async _send() {
     const input = this.shadowRoot.getElementById("msg");
     const content = (input.value || "").trim();
-    if (!content || this._busy) return;
+    const image = this._pendingImage;
+    if ((!content && !image) || this._busy) return;
 
+    this._stopSpeech();
     this._busy = true;
     this._error = null;
+    this._speechError = null;
     this._draft = "";
+    // Eigene Nachricht: immer ans Ende scrollen.
+    this._nearBottom = true;
+    this._unseenBelow = false;
     input.value = "";
     this._render();
 
     try {
-      const result = await this._api("POST", "messages", {
+      const body = {
         content,
         conversationId: this._conversation ? this._conversation.id : null,
-      });
+      };
+      if (image) {
+        body.imageBase64 = image.base64;
+        body.imageContentType = image.contentType;
+        body.imageFileName = image.fileName;
+      }
+      const result = await this._api("POST", "messages", body);
+      this._clearPendingImage();
       await this._openConversation(result.conversationId);
       // Refresh the conversation list (title / ordering may have changed).
       this._conversations = await this._api("GET", "conversations");
@@ -338,6 +373,7 @@ class AllroggenChatPanel extends HTMLElement {
       if (Date.now() - started > POLL_TIMEOUT_MS) {
         this._stopPolling();
         this._busy = false;
+        this._cancelling = false;
         this._error = "Die Antwort dauert länger als erwartet — bitte später erneut prüfen.";
         this._render();
         return;
@@ -352,11 +388,12 @@ class AllroggenChatPanel extends HTMLElement {
         if (done) {
           this._stopPolling();
           this._busy = false;
+          this._cancelling = false;
           this._conversation = conv;
           // Quota may have moved — refresh config in the background.
           this._api("GET", "config").then((c) => { this._config = c; this._render(); });
           this._render();
-          this._scrollDown();
+          this._onNewContent();
         }
       } catch (_) { /* keep polling on transient errors */ }
     }, POLL_INTERVAL_MS);
@@ -366,6 +403,266 @@ class AllroggenChatPanel extends HTMLElement {
     if (this._pollTimer) {
       clearInterval(this._pollTimer);
       this._pollTimer = null;
+    }
+  }
+
+  // ---- Scrollen ---------------------------------------------------------------
+
+  _isNearBottom(el) {
+    return el.scrollHeight - el.scrollTop - el.clientHeight < 80;
+  }
+
+  /**
+   * Ans Ende scrollen — per doppeltem requestAnimationFrame, damit Layout
+   * und Paint nach einem _render() abgeschlossen sind.
+   */
+  _scrollDown(smooth) {
+    const el = this.shadowRoot && this.shadowRoot.getElementById("messages");
+    if (!el) return;
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => {
+        if (!el.isConnected) return;
+        el.scrollTo({ top: el.scrollHeight, behavior: smooth ? "smooth" : "auto" });
+      });
+    });
+  }
+
+  /**
+   * Nach neuem Inhalt (Delta, Nachricht, Polling-Treffer): nur scrollen,
+   * wenn der Nutzer unten ist — sonst die „Neue Nachrichten"-Pille zeigen.
+   */
+  _onNewContent() {
+    if (this._nearBottom) {
+      this._scrollDown();
+    } else {
+      this._unseenBelow = true;
+      this._showNewMsgsPill();
+    }
+  }
+
+  /** Pille ohne Full-Re-Render einblenden (z. B. während Delta-Streaming). */
+  _showNewMsgsPill() {
+    const wrap = this.shadowRoot && this.shadowRoot.querySelector(".messages-wrap");
+    if (!wrap || this.shadowRoot.getElementById("new-msgs")) return;
+    const pill = document.createElement("button");
+    pill.type = "button";
+    pill.className = "new-msgs";
+    pill.id = "new-msgs";
+    pill.textContent = "↓ Neue Nachrichten";
+    pill.addEventListener("click", () => this._jumpToLatest());
+    wrap.appendChild(pill);
+  }
+
+  _hideNewMsgsPill() {
+    this._unseenBelow = false;
+    const pill = this.shadowRoot && this.shadowRoot.getElementById("new-msgs");
+    if (pill) pill.remove();
+  }
+
+  _jumpToLatest() {
+    this._hideNewMsgsPill();
+    this._nearBottom = true;
+    this._scrollDown(true);
+  }
+
+  // ---- Abbrechen -------------------------------------------------------------
+
+  async _cancel() {
+    if (!this._conversation || !this._busy || this._cancelling) return;
+    this._cancelling = true;
+    this._render();
+    try {
+      await this._api("POST", `conversations/${this._conversation.id}/cancel`);
+      // _busy bleibt bestehen, bis das terminale Event eintrifft (SSE
+      // assistant.state cancelled/done/error bzw. die persistierte
+      // Abbruch-Nachricht im Polling-Fallback).
+    } catch (err) {
+      this._cancelling = false;
+      this._error = this._describeError(err);
+      this._render();
+    }
+  }
+
+  // ---- Bild-Upload -------------------------------------------------------------
+
+  async _handleImageFile(file) {
+    if (!file) return;
+    if (!file.type.startsWith("image/")) {
+      this._error = "Nur Bilddateien können angehängt werden.";
+      this._render();
+      return;
+    }
+    try {
+      let blob = file;
+      let contentType = file.type;
+      // Kleine Bilder unverändert lassen, große clientseitig als JPEG
+      // verkleinern (max. 1600 px, Qualität 0.85).
+      if (file.size >= 300 * 1024) {
+        const downscaled = await this._downscaleImage(file);
+        if (downscaled) {
+          blob = downscaled;
+          contentType = "image/jpeg";
+        }
+      }
+      const base64 = await this._blobToBase64(blob);
+      this._clearPendingImage();
+      this._pendingImage = {
+        base64,
+        contentType,
+        fileName: file.name,
+        previewUrl: URL.createObjectURL(blob),
+      };
+    } catch (_) {
+      this._error = "Das Bild konnte nicht verarbeitet werden.";
+    }
+    this._render();
+  }
+
+  _downscaleImage(file) {
+    return new Promise((resolve) => {
+      const url = URL.createObjectURL(file);
+      const img = new Image();
+      img.onload = () => {
+        URL.revokeObjectURL(url);
+        const max = 1600;
+        let { width, height } = img;
+        if (width > max || height > max) {
+          const scale = max / Math.max(width, height);
+          width = Math.round(width * scale);
+          height = Math.round(height * scale);
+        }
+        const canvas = document.createElement("canvas");
+        canvas.width = width;
+        canvas.height = height;
+        canvas.getContext("2d").drawImage(img, 0, 0, width, height);
+        canvas.toBlob((b) => resolve(b), "image/jpeg", 0.85);
+      };
+      img.onerror = () => {
+        URL.revokeObjectURL(url);
+        resolve(null); // Fallback: Originaldatei verwenden
+      };
+      img.src = url;
+    });
+  }
+
+  _blobToBase64(blob) {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(String(reader.result).split(",")[1] || "");
+      reader.onerror = reject;
+      reader.readAsDataURL(blob);
+    });
+  }
+
+  _clearPendingImage() {
+    if (this._pendingImage && this._pendingImage.previewUrl) {
+      URL.revokeObjectURL(this._pendingImage.previewUrl);
+    }
+    this._pendingImage = null;
+  }
+
+  // ---- Spracheingabe (Web Speech API) ------------------------------------------
+
+  _speechSupported() {
+    return !!(window.SpeechRecognition || window.webkitSpeechRecognition);
+  }
+
+  _toggleSpeech() {
+    if (this._recording) {
+      this._stopSpeech();
+      this._render();
+      return;
+    }
+    const Ctor = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (!Ctor) return;
+    const input = this.shadowRoot.getElementById("msg");
+    this._speechBase = input && input.value ? input.value.trimEnd() + " " : "";
+    this._speechFinal = "";
+    const rec = new Ctor();
+    rec.lang = "de-DE";
+    rec.interimResults = true;
+    rec.continuous = false;
+    rec.onresult = (e) => {
+      let interim = "";
+      for (let i = e.resultIndex; i < e.results.length; i++) {
+        const r = e.results[i];
+        if (r.isFinal) this._speechFinal += r[0].transcript;
+        else interim += r[0].transcript;
+      }
+      const el = this.shadowRoot.getElementById("msg");
+      if (el) el.value = this._speechBase + this._speechFinal + interim;
+    };
+    rec.onerror = (e) => {
+      this._speechError =
+        e && e.error === "not-allowed"
+          ? "Mikrofon-Zugriff verweigert — bitte im Browser freigeben."
+          : "Spracherkennung fehlgeschlagen.";
+      this._stopSpeech();
+      this._render();
+    };
+    rec.onend = () => {
+      this._stopSpeech();
+      this._render();
+    };
+    this._recognition = rec;
+    this._recording = true;
+    this._speechError = null;
+    try {
+      rec.start();
+    } catch (_) {
+      this._stopSpeech();
+    }
+    this._render();
+  }
+
+  _stopSpeech() {
+    if (this._recognition) {
+      try { this._recognition.stop(); } catch (_) { /* schon beendet */ }
+      this._recognition = null;
+    }
+    this._recording = false;
+  }
+
+  // ---- Anhänge in Nachrichten ----------------------------------------------------
+
+  /** Object-URL für den Anhang einer User-Nachricht (ein Fetch pro id). */
+  _attachmentUrl(messageId) {
+    if (!this._attachmentPromises.has(messageId)) {
+      this._attachmentPromises.set(
+        messageId,
+        (async () => {
+          const resp = await fetch(`${API_BASE}/messages/${messageId}/attachment`, {
+            headers: {
+              Authorization: `Bearer ${this._hass.auth.data.access_token}`,
+            },
+          });
+          if (!resp.ok) throw { status: resp.status };
+          const blob = await resp.blob();
+          const url = URL.createObjectURL(blob);
+          this._attachmentUrls.set(messageId, url);
+          return url;
+        })()
+      );
+    }
+    return this._attachmentPromises.get(messageId);
+  }
+
+  /** Anhang-Bilder nach einem _render() nachladen (img src wird verworfen). */
+  _loadAttachments() {
+    const imgs = this.shadowRoot.querySelectorAll("img.attachment[data-attachment-id]");
+    for (const img of imgs) {
+      img.addEventListener("load", () => {
+        // Nachgeladene Bilder verschieben das Layout — unten mitziehen.
+        if (this._nearBottom) this._scrollDown();
+      });
+      this._attachmentUrl(Number(img.dataset.attachmentId))
+        .then((url) => {
+          if (img.isConnected) {
+            img.src = url;
+            img.hidden = false;
+          }
+        })
+        .catch(() => { /* Platzhalter bleibt verborgen */ });
     }
   }
 
@@ -432,25 +729,36 @@ class AllroggenChatPanel extends HTMLElement {
     return `<div class="conv-usage" id="conv-usage">${this._esc(this._usageText(u))}</div>`;
   }
 
+  /** Zeitstempel unter einer Nachricht (HH:MM, de-DE). */
+  _timeHtml(m) {
+    const d = new Date(m.sentAt);
+    if (isNaN(d.getTime())) return "";
+    const t = d.toLocaleTimeString("de-DE", { hour: "2-digit", minute: "2-digit" });
+    return `<div class="meta">${t}</div>`;
+  }
+
   _messagesHtml() {
     if (this._conversation === null) {
-      return `<div class="empty">Neue Unterhaltung — schreib einfach unten deine Frage. 🙂</div>`;
+      return `<div class="empty"><div class="empty-icon">💬</div>Neue Unterhaltung — schreib einfach unten deine Frage.</div>`;
     }
     if (this._conversation.messages.length === 0) {
-      return `<div class="empty">Lade…</div>`;
+      return `<div class="empty"><div class="empty-icon">⏳</div>Lade…</div>`;
     }
     return this._conversation.messages
       .map((m) => {
         if (m.role === "User") {
-          return `<div class="msg user"><div class="bubble">${this._md(m.content)}</div></div>`;
+          const img = m.hasAttachment
+            ? `<img class="attachment" data-attachment-id="${m.id}" alt="${this._esc(m.attachmentFileName || "Anhang")}" hidden />`
+            : "";
+          return `<div class="msg user"><div class="bubble">${img}${this._md(m.content)}</div>${this._timeHtml(m)}</div>`;
         }
         if (m.role === "Tool") {
           return `<div class="msg tool">⚙️ ${this._esc(m.content).slice(0, 120)}</div>`;
         }
         if (m.role === "Error") {
-          return `<div class="msg assistant"><div class="bubble error">⚠️ ${this._md(m.content)}</div></div>`;
+          return `<div class="msg assistant"><div class="bubble error">⚠️ ${this._md(m.content)}</div>${this._timeHtml(m)}</div>`;
         }
-        return `<div class="msg assistant"><div class="bubble">${this._md(m.content)}</div></div>`;
+        return `<div class="msg assistant"><div class="bubble">${this._md(m.content)}</div>${this._timeHtml(m)}</div>`;
       })
       .join("");
   }
@@ -461,6 +769,9 @@ class AllroggenChatPanel extends HTMLElement {
     const prevInput = this.shadowRoot.getElementById("msg");
     const prevValue = prevInput ? prevInput.value : "";
     const hadFocus = prevInput !== null && this.shadowRoot.activeElement === prevInput;
+    // Scroll-Position merken, wenn der Nutzer weiter oben liest.
+    const prevMessages = this.shadowRoot.getElementById("messages");
+    const prevScrollTop = prevMessages ? prevMessages.scrollTop : 0;
     const agentName = this._config && this._config.assistantName
       ? this._config.assistantName
       : "Support";
@@ -478,42 +789,97 @@ class AllroggenChatPanel extends HTMLElement {
     this.shadowRoot.innerHTML = `
       <style>
         :host { display: block; height: 100%; }
-        .wrap { display: flex; flex-direction: column; height: 100%; max-width: 900px; margin: 0 auto; padding: 16px; box-sizing: border-box; }
-        .header { display: flex; align-items: center; gap: 12px; margin-bottom: 8px; }
-        .header h1 { font-size: 20px; margin: 0; flex: 1; }
-        .toolbar { display: flex; gap: 8px; align-items: center; margin-bottom: 8px; }
-        select { flex: 1; padding: 8px; border-radius: 6px; border: 1px solid var(--divider-color, #ddd); background: var(--card-background-color, #fff); color: var(--primary-text-color, #222); }
-        button { padding: 8px 14px; border: none; border-radius: 6px; background: var(--primary-color, #03a9f4); color: #fff; cursor: pointer; font-size: 14px; }
-        button:disabled { opacity: 0.5; cursor: default; }
-        button.secondary { background: var(--secondary-background-color, #e0e0e0); color: var(--primary-text-color, #222); }
-        .quota { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--secondary-text-color, #666); }
-        .quota-bar { width: 120px; height: 8px; border-radius: 4px; background: var(--divider-color, #ddd); overflow: hidden; }
-        .quota-fill { height: 100%; background: var(--primary-color, #03a9f4); }
+        .wrap { display: flex; flex-direction: column; height: 100%; max-width: 720px; margin: 0 auto; padding: 16px 16px 12px; box-sizing: border-box; gap: 8px; }
+
+        /* Header */
+        .header { display: flex; align-items: center; gap: 12px; }
+        .avatar { width: 42px; height: 42px; border-radius: 50%; flex-shrink: 0; display: flex; align-items: center; justify-content: center; font-size: 18px; font-weight: 600; color: #fff; background: var(--primary-color, #03a9f4); background: linear-gradient(135deg, var(--primary-color, #03a9f4), var(--accent-color, #5c6bc0)); }
+        .header-text { flex: 1; min-width: 0; }
+        .header h1 { font-size: 18px; margin: 0; font-weight: 600; }
+        .quota { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--secondary-text-color, #666); margin-top: 4px; }
+        .quota-bar { width: 110px; height: 5px; border-radius: 3px; background: var(--divider-color, #ddd); overflow: hidden; }
+        .quota-fill { height: 100%; background: var(--primary-color, #03a9f4); transition: width 0.3s; }
         .quota-warning .quota-fill { background: #f57c00; }
         .quota-exceeded .quota-fill { background: #d32f2f; }
-        .messages { flex: 1; overflow-y: auto; padding: 12px 4px; display: flex; flex-direction: column; gap: 8px; }
-        .empty { text-align: center; color: var(--secondary-text-color, #666); margin-top: 40px; }
-        .msg { display: flex; }
-        .msg.user { justify-content: flex-end; }
-        .bubble { max-width: 75%; padding: 10px 14px; border-radius: 14px; background: var(--secondary-background-color, #eee); color: var(--primary-text-color, #222); line-height: 1.45; word-wrap: break-word; }
-        .bubble.draft { opacity: 0.85; }
-        .msg.user .bubble { background: var(--primary-color, #03a9f4); color: #fff; }
-        .bubble.error { background: #ffebee; color: #b71c1c; }
-        .bubble code { font-family: monospace; background: rgba(0,0,0,0.08); padding: 1px 4px; border-radius: 4px; }
-        .msg.tool { font-size: 12px; color: var(--secondary-text-color, #888); padding-left: 8px; }
-        .error-banner { background: #ffebee; color: #b71c1c; padding: 10px 14px; border-radius: 8px; margin-bottom: 8px; }
-        .notice { background: #fff8e1; color: #795548; padding: 10px 14px; border-radius: 8px; margin-bottom: 8px; }
-        .composer { display: flex; gap: 8px; padding-top: 8px; border-top: 1px solid var(--divider-color, #ddd); }
-        .composer input { flex: 1; padding: 12px; border-radius: 8px; border: 1px solid var(--divider-color, #ddd); font-size: 14px; background: var(--card-background-color, #fff); color: var(--primary-text-color, #222); }
-        .busy { font-size: 13px; color: var(--secondary-text-color, #666); padding: 4px 8px; }
-        .model-info { font-size: 12px; color: var(--secondary-text-color, #666); margin: -4px 0 8px; }
         .quota .cost { font-weight: 600; }
-        .conv-usage { font-size: 12px; color: var(--secondary-text-color, #666); margin: -4px 0 8px; }
+        .model-info, .conv-usage { font-size: 12px; color: var(--secondary-text-color, #666); }
+
+        /* Buttons */
+        button { font: inherit; border: none; cursor: pointer; }
+        button:disabled { opacity: 0.5; cursor: default; }
+        button:focus-visible, select:focus-visible { outline: 2px solid var(--primary-color, #03a9f4); outline-offset: 1px; }
+        .btn { padding: 8px 14px; border-radius: 10px; background: var(--secondary-background-color, #e0e0e0); color: var(--primary-text-color, #222); font-size: 13px; }
+        .btn:hover:not(:disabled) { filter: brightness(0.96); }
+
+        /* Toolbar */
+        .toolbar { display: flex; gap: 8px; align-items: center; }
+        select { flex: 1; min-width: 0; padding: 8px 10px; border-radius: 10px; border: 1px solid var(--divider-color, #ddd); background: var(--card-background-color, #fff); color: var(--primary-text-color, #222); font-size: 13px; }
+
+        /* Nachrichten */
+        .messages-wrap { position: relative; flex: 1; min-height: 0; display: flex; }
+        .messages { flex: 1; overflow-y: auto; padding: 12px 6px; display: flex; flex-direction: column; gap: 10px; scroll-behavior: smooth; }
+        .messages::-webkit-scrollbar { width: 6px; }
+        .messages::-webkit-scrollbar-thumb { background: var(--divider-color, #ccc); border-radius: 3px; }
+        .messages::-webkit-scrollbar-track { background: transparent; }
+        .empty { margin: auto; padding: 24px; text-align: center; color: var(--secondary-text-color, #666); }
+        .empty .empty-icon { font-size: 40px; margin-bottom: 8px; }
+        .msg { display: flex; flex-direction: column; align-items: flex-start; }
+        .msg.user { align-items: flex-end; }
+        .msg.tool { align-items: center; font-size: 12px; font-style: italic; color: var(--secondary-text-color, #888); }
+        .bubble { max-width: 78%; padding: 10px 14px; border-radius: 16px; border-bottom-left-radius: 4px; background: var(--card-background-color, #fff); border: 1px solid var(--divider-color, #e2e2e2); box-shadow: 0 1px 2px rgba(0,0,0,0.07); color: var(--primary-text-color, #222); line-height: 1.45; word-wrap: break-word; }
+        .msg.user .bubble { background: var(--primary-color, #03a9f4); background: linear-gradient(135deg, var(--primary-color, #03a9f4), color-mix(in srgb, var(--primary-color, #03a9f4) 78%, #000)); color: #fff; border: none; box-shadow: 0 1px 3px rgba(0,0,0,0.18); border-radius: 16px; border-bottom-right-radius: 4px; }
+        .bubble.draft { opacity: 0.85; }
+        .bubble.error { background: #fdecea; color: #b71c1c; border-color: #f5c6c0; box-shadow: none; }
+        .bubble code { font-family: monospace; background: rgba(127,127,127,0.15); padding: 1px 4px; border-radius: 4px; }
+        .meta { font-size: 11px; color: var(--secondary-text-color, #888); margin: 2px 6px 0; }
+        .bubble.typing { display: inline-flex; gap: 5px; align-items: center; padding: 13px 16px; }
+        .bubble.typing .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--secondary-text-color, #999); animation: typing-bounce 1.2s infinite; }
+        .bubble.typing .dot:nth-child(2) { animation-delay: 0.15s; }
+        .bubble.typing .dot:nth-child(3) { animation-delay: 0.3s; }
+        @keyframes typing-bounce { 0%, 60%, 100% { transform: translateY(0); opacity: 0.5; } 30% { transform: translateY(-4px); opacity: 1; } }
+        .new-msgs { position: absolute; bottom: 12px; left: 50%; transform: translateX(-50%); z-index: 2; padding: 6px 14px; border-radius: 999px; background: var(--primary-color, #03a9f4); color: #fff; font-size: 12px; box-shadow: 0 2px 8px rgba(0,0,0,0.25); }
+        .new-msgs:hover { filter: brightness(1.1); }
+        img.attachment { display: block; max-width: 250px; border-radius: 12px; margin-bottom: 6px; }
+
+        /* Banner */
+        .error-banner { background: #fdecea; color: #b71c1c; padding: 10px 14px; border-radius: 12px; font-size: 13px; }
+        .notice { background: var(--secondary-background-color, #fff8e1); color: var(--primary-text-color, #795548); padding: 10px 14px; border-radius: 12px; font-size: 13px; }
+
+        /* Bild-Vorschau-Chip */
+        .img-preview { display: flex; align-items: center; gap: 10px; padding: 8px; border-radius: 12px; border: 1px solid var(--divider-color, #ddd); background: var(--card-background-color, #fff); }
+        .img-preview img { width: 56px; height: 56px; object-fit: cover; border-radius: 8px; }
+        .img-preview .file-name { flex: 1; min-width: 0; font-size: 12px; color: var(--secondary-text-color, #666); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .img-preview button { width: 28px; height: 28px; flex-shrink: 0; border-radius: 50%; background: var(--secondary-background-color, #eee); color: var(--primary-text-color, #222); font-size: 12px; }
+        .speech-error { font-size: 12px; color: #b71c1c; }
+
+        /* Composer */
+        .composer { display: flex; align-items: center; gap: 4px; padding: 6px; border-radius: 24px; border: 1px solid var(--divider-color, #ddd); background: var(--card-background-color, #fff); box-shadow: 0 1px 4px rgba(0,0,0,0.08); }
+        .composer:focus-within { border-color: var(--primary-color, #03a9f4); }
+        .composer input#msg { flex: 1; min-width: 0; border: none; background: transparent; padding: 8px 10px; font-size: 14px; color: var(--primary-text-color, #222); }
+        .composer input#msg:focus, .composer input#msg:focus-visible { outline: none; }
+        .icon-btn { width: 36px; height: 36px; flex-shrink: 0; border-radius: 50%; background: transparent; color: var(--secondary-text-color, #666); font-size: 17px; display: flex; align-items: center; justify-content: center; }
+        .icon-btn:hover:not(:disabled) { background: var(--secondary-background-color, #eee); }
+        .icon-btn.recording { background: #d32f2f; color: #fff; animation: mic-pulse 1.2s infinite; }
+        @keyframes mic-pulse { 0% { opacity: 1; } 50% { opacity: 0.55; } 100% { opacity: 1; } }
+        .send-btn { width: 38px; height: 38px; flex-shrink: 0; border-radius: 50%; background: var(--primary-color, #03a9f4); color: #fff; font-size: 16px; display: flex; align-items: center; justify-content: center; }
+        .send-btn:hover:not(:disabled) { filter: brightness(1.1); }
+        .cancel-btn { padding: 8px 14px; flex-shrink: 0; border-radius: 19px; background: transparent; border: 1px solid #d32f2f; color: #d32f2f; font-size: 13px; }
+        .cancel-btn:hover:not(:disabled) { background: rgba(211,47,47,0.08); }
+
+        @media (max-width: 560px) {
+          .wrap { padding: 8px; }
+          .bubble { max-width: 88%; }
+          .header h1 { font-size: 16px; }
+          .avatar { width: 36px; height: 36px; font-size: 16px; }
+        }
       </style>
       <div class="wrap">
         <div class="header">
-          <h1>💬 ${this._esc(agentName)}</h1>
-          ${this._quotaHtml()}
+          <div class="avatar">${this._esc(agentName.trim().charAt(0).toUpperCase() || "?")}</div>
+          <div class="header-text">
+            <h1>${this._esc(agentName)}</h1>
+            ${this._quotaHtml()}
+          </div>
         </div>
         ${this._modelHtml()}
         ${this._error ? `<div class="error-banner">${this._esc(this._error)}</div>` : ""}
@@ -524,23 +890,55 @@ class AllroggenChatPanel extends HTMLElement {
             ${this._conversation === null ? `<option value="" selected>— Neue Unterhaltung —</option>` : ""}
             ${convOptions}
           </select>
-          <button class="secondary" id="new">Neu</button>
-          ${this._conversation ? `<button class="secondary" id="del">Löschen</button>` : ""}
+          <button type="button" class="btn" id="new">Neu</button>
+          ${this._conversation ? `<button type="button" class="btn" id="del">Löschen</button>` : ""}
         </div>
         ${this._usageHtml()}
-        <div class="messages" id="messages">
-          ${this._messagesHtml()}
-          ${this._draft ? `<div class="msg assistant" id="draft-bubble"><div class="bubble draft">${this._md(this._draft)}</div></div>` : ""}
-          ${this._busy && !this._draft ? `<div class="busy">Der Agent arbeitet…</div>` : ""}
+        <div class="messages-wrap">
+          <div class="messages" id="messages">
+            ${this._messagesHtml()}
+            ${this._draft ? `<div class="msg assistant" id="draft-bubble"><div class="bubble draft">${this._md(this._draft)}</div></div>` : ""}
+            ${this._busy && !this._draft ? `
+              <div class="msg assistant busy">
+                <div class="bubble typing" title="${this._cancelling ? "Wird abgebrochen…" : "Der Agent arbeitet…"}"><span class="dot"></span><span class="dot"></span><span class="dot"></span></div>
+                ${this._cancelling ? `<div class="meta">Wird abgebrochen…</div>` : ""}
+              </div>` : ""}
+          </div>
+          ${this._unseenBelow ? `<button type="button" class="new-msgs" id="new-msgs">↓ Neue Nachrichten</button>` : ""}
         </div>
+        ${this._pendingImage ? `
+          <div class="img-preview">
+            <img src="${this._esc(this._pendingImage.previewUrl)}" alt="${this._esc(this._pendingImage.fileName)}" />
+            <span class="file-name">${this._esc(this._pendingImage.fileName)}</span>
+            <button type="button" id="rmimg" title="Bild entfernen">✕</button>
+          </div>` : ""}
+        ${this._speechError ? `<div class="speech-error">${this._esc(this._speechError)}</div>` : ""}
         <div class="composer">
+          <input type="file" id="imgfile" accept="image/*" hidden />
+          <button type="button" class="icon-btn" id="attach" title="Bild anhängen" ${inputDisabled ? "disabled" : ""}>📎</button>
+          ${this._speechSupported() ? `<button type="button" class="icon-btn ${this._recording ? "recording" : ""}" id="mic" title="Spracheingabe" ${inputDisabled ? "disabled" : ""}>🎤</button>` : ""}
           <input id="msg" placeholder="Nachricht schreiben…" ${inputDisabled ? "disabled" : ""} />
-          <button id="send" ${inputDisabled ? "disabled" : ""}>Senden</button>
+          ${this._busy && this._conversation
+            ? `<button type="button" class="cancel-btn" id="cancel" ${this._cancelling ? "disabled" : ""}>Abbrechen</button>`
+            : `<button type="button" class="send-btn" id="send" title="Senden" ${inputDisabled ? "disabled" : ""}>➤</button>`}
         </div>
       </div>
     `;
 
-    this.shadowRoot.getElementById("send").addEventListener("click", () => this._send());
+    const send = this.shadowRoot.getElementById("send");
+    if (send) send.addEventListener("click", () => this._send());
+    const cancel = this.shadowRoot.getElementById("cancel");
+    if (cancel) cancel.addEventListener("click", () => this._cancel());
+    const imgfile = this.shadowRoot.getElementById("imgfile");
+    this.shadowRoot.getElementById("attach").addEventListener("click", () => imgfile.click());
+    imgfile.addEventListener("change", (e) => {
+      const f = e.target.files && e.target.files[0];
+      if (f) this._handleImageFile(f);
+    });
+    const rmimg = this.shadowRoot.getElementById("rmimg");
+    if (rmimg) rmimg.addEventListener("click", () => { this._clearPendingImage(); this._render(); });
+    const mic = this.shadowRoot.getElementById("mic");
+    if (mic) mic.addEventListener("click", () => this._toggleSpeech());
     const msgInput = this.shadowRoot.getElementById("msg");
     if (prevValue) msgInput.value = prevValue;
     if (hadFocus && !msgInput.disabled) msgInput.focus();
@@ -553,12 +951,35 @@ class AllroggenChatPanel extends HTMLElement {
     this.shadowRoot.getElementById("new").addEventListener("click", () => this._newConversation());
     const del = this.shadowRoot.getElementById("del");
     if (del) del.addEventListener("click", () => this._deleteConversation());
+    const pill = this.shadowRoot.getElementById("new-msgs");
+    if (pill) pill.addEventListener("click", () => this._jumpToLatest());
+    const messagesEl = this.shadowRoot.getElementById("messages");
+    messagesEl.addEventListener("scroll", () => {
+      if (this._isNearBottom(messagesEl)) {
+        this._nearBottom = true;
+        if (this._unseenBelow) this._hideNewMsgsPill();
+      } else if (messagesEl.scrollTop < this._lastScrollTop) {
+        // Nur ein aktives Hochscrollen des Nutzers löst das "unten" los —
+        // reines Content-Wachstum (Deltas, nachgeladene Bilder) nicht.
+        this._nearBottom = false;
+      }
+      this._lastScrollTop = messagesEl.scrollTop;
+    });
+    this._loadAttachments();
+    if (this._nearBottom) {
+      this._scrollDown();
+    } else if (prevScrollTop > 0) {
+      // Leseposition über den Re-Render hinweg wiederherstellen.
+      const top = prevScrollTop;
+      requestAnimationFrame(() => {
+        if (messagesEl.isConnected) {
+          messagesEl.scrollTop = top;
+          this._lastScrollTop = top;
+        }
+      });
+    }
   }
 
-  _scrollDown() {
-    const el = this.shadowRoot && this.shadowRoot.getElementById("messages");
-    if (el) el.scrollTop = el.scrollHeight;
-  }
 }
 
 customElements.define("allroggen-chat-panel", AllroggenChatPanel);

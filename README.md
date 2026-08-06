@@ -31,6 +31,20 @@ Home Assistant des Kunden arbeiten (Automationen, Dashboards, Helfer).
 2. Backend-Adresse (z. B. `https://ticket.example.com`) und Token eintragen
 3. In der Seitenleiste erscheint **Allroggen Support** — fertig.
 
+## Funktionen
+
+- Streaming-Antworten des Support-Agenten (SSE, mit Polling-Fallback)
+- **Bild-Upload**: Per 📎-Button lassen sich Bilder anhängen (clientseitig
+  verkleinert, max. 1600 px). Hinweis: Die Bildanalyse erfordert ein
+  vision-fähiges Chat-Modell im Ticket-System — der voreingestellte
+  MiniMax-M2 ist reine Text-KI und ignoriert Anhänge.
+- **Spracheingabe**: Per 🎤-Button wird diktierter Text ins Eingabefeld
+  geschrieben (Web Speech API, Deutsch). Erfordert Chrome oder Edge —
+  Firefox unterstützt die Web Speech API nicht, dort wird der Button
+  nicht angezeigt.
+- **Abbrechen**: Während der Agent arbeitet, kann der laufende Turn per
+  „Abbrechen"-Button gestoppt werden.
+
 ## Chat-Budget
 
 Der Chat hat je nach Vereinbarung ein monatliches Kostenlimit in Euro. Der
