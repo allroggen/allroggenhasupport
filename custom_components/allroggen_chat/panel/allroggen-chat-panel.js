@@ -816,7 +816,18 @@ class AllroggenChatPanel extends HTMLElement {
 
   _usageText(u) {
     const tokens = Number(u.totalTokens).toLocaleString("de-DE");
-    return `Diese Unterhaltung: ${tokens} Tokens`;
+    let text = `Diese Unterhaltung: ${tokens} Tokens`;
+    // Kontext-Füllstand: tatsächliche Input-Tokens der letzten Runde im
+    // Verhältnis zum Kontextfenster des Modells (Backend liefert beides im
+    // Usage-Objekt; das Fenster aus der Config dient als Fallback).
+    const win = Number(u.contextWindowTokens || (this._config && this._config.contextWindowTokens) || 0);
+    if (u.lastInputTokens && win > 0) {
+      const pct = Math.round((Number(u.lastInputTokens) / win) * 100);
+      text += pct >= 85
+        ? ` · ⚠ Kontext zu ${pct} % belegt — bald neue Unterhaltung nötig`
+        : ` · Kontext ${pct} % belegt`;
+    }
+    return text;
   }
 
   _usageHtml() {
