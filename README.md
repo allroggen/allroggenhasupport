@@ -28,7 +28,7 @@ Home Assistant des Kunden arbeiten (Automationen, Dashboards, Helfer).
 | 🖼️ **Bild-Upload** | Per 📎-Button Bilder anhängen (clientseitig verkleinert, max. 1600 px). Erfordert ein vision-fähiges Chat-Modell im Ticket-System — der voreingestellte MiniMax-M2 ist reine Text-KI und ignoriert Anhänge |
 | 🎤 **Spracheingabe** | Diktieren statt tippen (Web Speech API, Deutsch). Erfordert Chrome oder Edge — in Firefox wird der Button nicht angezeigt |
 | ⏹️ **Abbrechen** | Ein laufender Turn lässt sich jederzeit per „Abbrechen"-Button stoppen |
-| 💶 **Transparente Kosten** | Monatsbudget-Balken und Token-/Kostensumme pro Unterhaltung |
+| 📊 **Kontingent im Blick** | Prozent-Ring fürs Monatskontingent und Tokensumme pro Unterhaltung — ganz ohne Preise |
 | 🔒 **Datenschutz** | Das Kunden-Token bleibt serverseitig — es erreicht nie den Browser |
 
 ## 📋 Voraussetzungen
@@ -60,16 +60,16 @@ Home Assistant des Kunden arbeiten (Automationen, Dashboards, Helfer).
 2. Backend-Adresse (z. B. `https://ticket.example.com`) und Token eintragen
 3. In der Seitenleiste erscheint **Allroggen Support** — fertig 🎉
 
-## 💶 Chat-Budget
+## 📊 Chat-Kontingent
 
-Der Chat hat je nach Vereinbarung ein monatliches Kostenlimit in Euro. Der
-Balken oben im Panel zeigt, wie viel Budget bereits verbraucht wurde, wie
-hoch das Limit ist und wie viel noch übrig ist; bei Überschreitung pausiert
-der Chat bis zum Monatswechsel. Ohne festes Limit wird nur der bisherige
-Monatsverbrauch in Euro angezeigt. Zusätzlich zeigt eine dezente Zeile über
-der Nachrichtenliste die Token- und Kostensumme der gerade geöffneten
-Unterhaltung. Unterhaltungen lassen sich in der einklappbaren Seitenleiste
-links wechseln, neu anlegen und löschen.
+Der Chat hat je nach Vereinbarung ein monatliches Kontingent. Ein Ring oben
+rechts im Panel zeigt in Prozent, wie viel davon bereits verbraucht wurde —
+blau im Normalbereich, orange ab der Warnschwelle, rot bei Überschreitung;
+bei Überschreitung pausiert der Chat bis zum Monatswechsel. Ohne festes
+Limit wird kein Ring angezeigt. Preise zeigt das Panel bewusst nicht.
+Zusätzlich zeigt eine dezente Zeile über der Nachrichtenliste die
+Tokensumme der gerade geöffneten Unterhaltung. Unterhaltungen lassen sich
+in der einklappbaren Seitenleiste links wechseln, neu anlegen und löschen.
 
 ## 🛠️ Fehlerbehebung
 

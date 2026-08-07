@@ -19,6 +19,14 @@ const POLL_TIMEOUT_MS = 5 * 60 * 1000;
 const SSE_BACKOFF_START_MS = 5000;
 const SSE_BACKOFF_MAX_MS = 60000;
 
+// Material Design Icons (24x24), eingefärbt über currentColor.
+const ICON_PAPERCLIP =
+  '<svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor" aria-hidden="true"><path d="M16.5,6V17.5A4,4 0 0,1 12.5,21.5A4,4 0 0,1 8.5,17.5V5A2.5,2.5 0 0,1 11,2.5A2.5,2.5 0 0,1 13.5,5V15.5A1,1 0 0,1 12.5,16.5A1,1 0 0,1 11.5,15.5V6H10V15.5A2.5,2.5 0 0,0 12.5,18A2.5,2.5 0 0,0 15,15.5V5A4,4 0 0,0 11,1A4,4 0 0,0 7,5V17.5A5.5,5.5 0 0,0 12.5,23A5.5,5.5 0 0,0 18,17.5V6H16.5Z"/></svg>';
+const ICON_MIC =
+  '<svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor" aria-hidden="true"><path d="M12,2A3,3 0 0,1 15,5V11A3,3 0 0,1 12,14A3,3 0 0,1 9,11V5A3,3 0 0,1 12,2M19,11C19,14.53 16.39,17.44 13,17.93V21H11V17.93C7.61,17.44 5,14.53 5,11H7A5,5 0 0,0 12,16A5,5 0 0,0 17,11H19Z"/></svg>';
+const ICON_SEND =
+  '<svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor" aria-hidden="true"><path d="M2,21L23,12L2,3V10L17,12L2,14V21Z"/></svg>';
+
 class AllroggenChatPanel extends HTMLElement {
   constructor() {
     super();
@@ -377,13 +385,8 @@ class AllroggenChatPanel extends HTMLElement {
       this._busy = false;
       if (err && err.status === 429 && err.body && err.body.quota) {
         const q = err.body.quota;
-        const eur = (v) => Number(v).toLocaleString("de-DE", { style: "currency", currency: "EUR" });
         const reset = new Date(q.resetsAt).toLocaleDateString("de-DE");
-        const used = q.usedCost != null ? eur(q.usedCost) : null;
-        const detail = q.costLimit != null
-          ? ` (${used || eur(0)} von ${eur(q.costLimit)})`
-          : used ? ` (${used})` : "";
-        this._error = `Dein monatliches Chat-Budget ist aufgebraucht${detail}. Es wird am ${reset} zurückgesetzt.`;
+        this._error = `Dein monatliches Chat-Kontingent ist aufgebraucht. Es wird am ${reset} zurückgesetzt.`;
         if (this._config) this._config.quota = q;
       } else {
         this._error = this._describeError(err);
@@ -766,24 +769,22 @@ class AllroggenChatPanel extends HTMLElement {
       .replace(/\n/g, "<br>");
   }
 
+  /** Kontingent-Ring im Header: nur Prozent, keine Euro-Werte. */
   _quotaHtml() {
     const q = this._config && this._config.quota;
-    if (!q) return "";
-    const eur = (v) => Number(v).toLocaleString("de-DE", { style: "currency", currency: "EUR" });
-    const used = q.usedCost != null ? eur(q.usedCost) : null;
-    if (q.costLimit == null) {
-      return used ? `<div class="quota"><span class="cost" title="Kosten diesen Monat">${used} diesen Monat</span></div>` : "";
-    }
+    if (!q || q.costLimit == null) return ""; // ohne Limit keine Kontingent-Anzeige
     const pct = q.costLimit > 0
       ? Math.min(100, Math.round((Number(q.usedCost || 0) / Number(q.costLimit)) * 100))
       : 100;
     const cls = q.exceeded ? "quota-exceeded" : q.warning ? "quota-warning" : "";
     const reset = new Date(q.resetsAt).toLocaleDateString("de-DE");
-    const remaining = q.remainingCost != null ? ` · ${eur(q.remainingCost)} übrig` : "";
     return `
-      <div class="quota ${cls}" title="Reset am ${reset}">
-        <div class="quota-bar"><div class="quota-fill" style="width:${pct}%"></div></div>
-        <span class="cost">${used || eur(0)} von ${eur(q.costLimit)}${remaining}</span>
+      <div class="quota ${cls}" title="${pct} % des Monatskontingents verbraucht · Reset am ${reset}">
+        <svg viewBox="0 0 36 36" class="quota-ring" role="img" aria-label="${pct} % des Monatskontingents verbraucht">
+          <circle class="ring-track" cx="18" cy="18" r="15.9155"></circle>
+          <circle class="ring-fill" cx="18" cy="18" r="15.9155" stroke-dasharray="${pct} ${100 - pct}"></circle>
+          <text class="ring-text" x="18" y="18" text-anchor="middle" dominant-baseline="central">${pct} %</text>
+        </svg>
       </div>`;
   }
 
@@ -800,11 +801,7 @@ class AllroggenChatPanel extends HTMLElement {
 
   _usageText(u) {
     const tokens = Number(u.totalTokens).toLocaleString("de-DE");
-    const cost = Number(u.cost).toLocaleString("de-DE", {
-      style: "currency",
-      currency: u.currency || "EUR",
-    });
-    return `Diese Unterhaltung: ${tokens} Tokens · ${cost}`;
+    return `Diese Unterhaltung: ${tokens} Tokens`;
   }
 
   _usageHtml() {
@@ -906,12 +903,13 @@ class AllroggenChatPanel extends HTMLElement {
         .avatar img { width: 100%; height: 100%; object-fit: cover; display: block; }
         .header-text { flex: 1; min-width: 0; }
         .header h1 { font-size: 18px; margin: 0; font-weight: 600; }
-        .quota { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--secondary-text-color, #666); margin-top: 4px; }
-        .quota-bar { width: 110px; height: 5px; border-radius: 3px; background: var(--divider-color, #ddd); overflow: hidden; }
-        .quota-fill { height: 100%; background: var(--primary-color, #03a9f4); transition: width 0.3s; }
-        .quota-warning .quota-fill { background: #f57c00; }
-        .quota-exceeded .quota-fill { background: #d32f2f; }
-        .quota .cost { font-weight: 600; }
+        .quota { flex-shrink: 0; display: flex; align-items: center; }
+        .quota-ring { width: 38px; height: 38px; display: block; }
+        .quota-ring .ring-track { fill: none; stroke: var(--divider-color, #ddd); stroke-width: 3.5; }
+        .quota-ring .ring-fill { fill: none; stroke: var(--primary-color, #03a9f4); stroke-width: 3.5; stroke-linecap: round; transform: rotate(-90deg); transform-origin: 50% 50%; transition: stroke-dasharray 0.3s; }
+        .quota-warning .ring-fill { stroke: #f57c00; }
+        .quota-exceeded .ring-fill { stroke: #d32f2f; }
+        .quota-ring .ring-text { font-size: 8.5px; fill: var(--secondary-text-color, #666); }
         .model-info, .conv-usage { font-size: 12px; color: var(--secondary-text-color, #666); }
 
         /* Buttons */
@@ -1010,13 +1008,13 @@ class AllroggenChatPanel extends HTMLElement {
           <div class="avatar"><img src="/allroggen_chat_static/logo.svg" alt="" onerror="this.outerHTML='${this._esc(agentName.trim().charAt(0).toUpperCase() || "?")}'"></div>
           <div class="header-text">
             <h1>${this._esc(agentName)}</h1>
-            ${this._quotaHtml()}
           </div>
+          ${this._quotaHtml()}
         </div>
         ${this._modelHtml()}
         ${this._error ? `<div class="error-banner">${this._esc(this._error)}</div>` : ""}
         ${noAgent ? `<div class="notice">Der Chat ist für deinen Zugang noch nicht eingerichtet. Bitte kontaktiere deinen Dienstleister.</div>` : ""}
-        ${quotaExceeded ? `<div class="notice">Monatliches Chat-Budget erschöpft — der Chat ist bis zum Reset pausiert.</div>` : ""}
+        ${quotaExceeded ? `<div class="notice">Monatliches Chat-Kontingent erschöpft — der Chat ist bis zum Reset pausiert.</div>` : ""}
         <div class="body">
           ${this._sidebarHtml()}
           <div class="main">
@@ -1042,12 +1040,12 @@ class AllroggenChatPanel extends HTMLElement {
             ${this._speechError ? `<div class="speech-error">${this._esc(this._speechError)}</div>` : ""}
             <div class="composer">
               <input type="file" id="imgfile" accept="image/*" hidden />
-              <button type="button" class="icon-btn" id="attach" title="Bild anhängen" ${inputDisabled ? "disabled" : ""}>📎</button>
-              ${this._speechSupported() ? `<button type="button" class="icon-btn ${this._recording ? "recording" : ""}" id="mic" title="Spracheingabe" ${inputDisabled ? "disabled" : ""}>🎤</button>` : ""}
+              <button type="button" class="icon-btn" id="attach" title="Bild anhängen" ${inputDisabled ? "disabled" : ""}>${ICON_PAPERCLIP}</button>
+              ${this._speechSupported() ? `<button type="button" class="icon-btn ${this._recording ? "recording" : ""}" id="mic" title="Spracheingabe" ${inputDisabled ? "disabled" : ""}>${ICON_MIC}</button>` : ""}
               <input id="msg" placeholder="Nachricht schreiben…" ${inputDisabled ? "disabled" : ""} />
               ${this._busy && this._conversation
                 ? `<button type="button" class="cancel-btn" id="cancel" ${this._cancelling ? "disabled" : ""}>Abbrechen</button>`
-                : `<button type="button" class="send-btn" id="send" title="Senden" ${inputDisabled ? "disabled" : ""}>➤</button>`}
+                : `<button type="button" class="send-btn" id="send" title="Senden" ${inputDisabled ? "disabled" : ""}>${ICON_SEND}</button>`}
             </div>
           </div>
         </div>
