@@ -26,6 +26,10 @@ const ICON_MIC =
   '<svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor" aria-hidden="true"><path d="M12,2A3,3 0 0,1 15,5V11A3,3 0 0,1 12,14A3,3 0 0,1 9,11V5A3,3 0 0,1 12,2M19,11C19,14.53 16.39,17.44 13,17.93V21H11V17.93C7.61,17.44 5,14.53 5,11H7A5,5 0 0,0 12,16A5,5 0 0,0 17,11H19Z"/></svg>';
 const ICON_SEND =
   '<svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor" aria-hidden="true"><path d="M2,21L23,12L2,3V10L17,12L2,14V21Z"/></svg>';
+// mdi:forum — Unterhaltungsliste (bewusst KEIN Hamburger, damit der Button
+// nicht mit HAs eigenem Sidebar-Toggle verwechselt wird).
+const ICON_FORUM =
+  '<svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor" aria-hidden="true"><path d="M17,12V3A1,1 0 0,0 16,2H3A1,1 0 0,0 2,3V17L6,13H16A1,1 0 0,0 17,12M21,6H19V15H6V17A1,1 0 0,0 7,18H18L22,22V7A1,1 0 0,0 21,6Z"/></svg>';
 
 class AllroggenChatPanel extends HTMLElement {
   constructor() {
@@ -56,6 +60,7 @@ class AllroggenChatPanel extends HTMLElement {
     this._unseenBelow = false; // neue Inhalte unterhalb der sichtbaren Position
     this._lastScrollTop = 0; // Unterscheidung Nutzer-Scroll vs. Content-Wachstum
     this._narrow = false; // schmaler Container → Sidebar als Overlay-Drawer
+    this._haNarrow = false; // HA-Viewport ist narrow (Property vom Panel-Host)
     this._drawerOpen = false; // Drawer im narrow-Modus
     this._resizeObserver = null;
     try {
@@ -70,6 +75,16 @@ class AllroggenChatPanel extends HTMLElement {
     const first = !this._hass;
     this._hass = hass;
     if (first) this._init();
+  }
+
+  // Vom HA-Panel-Host gesetzt, wenn der Viewport narrow ist (Sidebar wird
+  // dann zum Drawer). Steuert, ob das eigene <ha-menu-button> sichtbar ist.
+  set narrow(value) {
+    const v = !!value;
+    if (v !== this._haNarrow) {
+      this._haNarrow = v;
+      if (this._hass) this._render();
+    }
   }
 
   disconnectedCallback() {
@@ -899,6 +914,7 @@ class AllroggenChatPanel extends HTMLElement {
 
         /* Header */
         .header { display: flex; align-items: center; gap: 12px; }
+        .ha-menu { flex-shrink: 0; margin-left: -8px; color: var(--primary-text-color, #222); }
         .avatar { width: 42px; height: 42px; border-radius: 50%; flex-shrink: 0; display: flex; align-items: center; justify-content: center; font-size: 18px; font-weight: 600; color: #fff; background: var(--primary-color, #03a9f4); background: linear-gradient(135deg, var(--primary-color, #03a9f4), var(--accent-color, #5c6bc0)); overflow: hidden; }
         .avatar img { width: 100%; height: 100%; object-fit: cover; display: block; }
         .header-text { flex: 1; min-width: 0; }
@@ -1004,7 +1020,10 @@ class AllroggenChatPanel extends HTMLElement {
       </style>
       <div class="${wrapClasses}">
         <div class="header">
-          <button type="button" class="icon-btn" id="conv-toggle" title="Unterhaltungen ein-/ausblenden">☰</button>
+          ${this._narrow || this._haNarrow
+            ? `<ha-menu-button class="ha-menu" narrow></ha-menu-button>`
+            : ""}
+          <button type="button" class="icon-btn" id="conv-toggle" title="Unterhaltungen ein-/ausblenden">${ICON_FORUM}</button>
           <div class="avatar"><img src="/allroggen_chat_static/logo.svg" alt="" onerror="this.outerHTML='${this._esc(agentName.trim().charAt(0).toUpperCase() || "?")}'"></div>
           <div class="header-text">
             <h1>${this._esc(agentName)}</h1>
