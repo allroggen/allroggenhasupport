@@ -855,16 +855,19 @@ class AllroggenChatPanel extends HTMLElement {
   }
 
   _messageHtml(m) {
-    if (m.role === "User") {
+    // Groß-/Kleinschreibung ignorieren: Live-SSE-Events liefern die Rolle
+    // ggf. anders serialisiert ("tool") als die gespeicherte Historie ("Tool").
+    const role = (m.role || "").toLowerCase();
+    if (role === "user") {
       const img = m.hasAttachment
         ? `<img class="attachment" data-attachment-id="${m.id}" alt="${this._esc(m.attachmentFileName || "Anhang")}" hidden />`
         : "";
       return `<div class="msg user"><div class="bubble">${img}${this._md(m.content)}</div>${this._timeHtml(m)}</div>`;
     }
-    if (m.role === "Tool") {
+    if (role === "tool") {
       return `<div class="msg tool">⚙️ ${this._esc(m.content).slice(0, 120)}</div>`;
     }
-    if (m.role === "Error") {
+    if (role === "error") {
       return `<div class="msg assistant"><div class="bubble error">⚠️ ${this._md(m.content)}</div>${this._timeHtml(m)}</div>`;
     }
     return `<div class="msg assistant"><div class="bubble">${this._md(m.content)}</div>${this._timeHtml(m)}</div>`;
@@ -971,7 +974,7 @@ class AllroggenChatPanel extends HTMLElement {
 
         /* Nachrichten */
         .messages-wrap { position: relative; flex: 1; min-height: 0; display: flex; }
-        .messages { flex: 1; min-height: 0; overflow-y: auto; padding: 12px 6px; display: flex; flex-direction: column; gap: 10px; scroll-behavior: smooth; }
+        .messages { flex: 1; min-height: 0; overflow-y: auto; padding: 12px 6px; display: flex; flex-direction: column; gap: 10px; }
         .day-sep { display: flex; align-items: center; justify-content: center; margin: 4px 0 0; }
         .day-sep span { font-size: 11px; color: var(--secondary-text-color, #888); background: var(--secondary-background-color, #eee); padding: 3px 12px; border-radius: 999px; }
         .messages::-webkit-scrollbar { width: 6px; }
@@ -1131,8 +1134,14 @@ class AllroggenChatPanel extends HTMLElement {
       this._lastScrollTop = messagesEl.scrollTop;
     });
     this._loadAttachments();
+    // Baseline für die Nutzer-Scroll-Erkennung: Das frisch gerenderte Element
+    // startet bei scrollTop 0 — ohne Reset würde der anschließende
+    // (ggf. animierte) Scroll nach unten fälschlich als „Nutzer scrollt hoch"
+    // gewertet und _nearBottom gelöscht.
+    this._lastScrollTop = messagesEl.scrollTop;
     if (this._nearBottom) {
-      this._scrollDown();
+      // Nach einem Voll-Re-Render sofort (ohne Animation) ans Ende springen.
+      this._scrollDown(false);
     } else if (prevScrollTop > 0) {
       // Leseposition über den Re-Render hinweg wiederherstellen.
       const top = prevScrollTop;
