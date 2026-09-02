@@ -151,6 +151,8 @@ class AllroggenChatProxyView(HomeAssistantView):
                 headers={
                     "Content-Type": "text/event-stream",
                     "Cache-Control": "no-cache",
+                    # Reverse proxies (z. B. nginx) sollen den Stream nicht puffern.
+                    "X-Accel-Buffering": "no",
                 },
             )
             await out.prepare(request)

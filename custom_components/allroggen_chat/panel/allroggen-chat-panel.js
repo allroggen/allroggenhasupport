@@ -18,6 +18,8 @@ const POLL_INTERVAL_MS = 3000;
 const POLL_TIMEOUT_MS = 5 * 60 * 1000;
 const SSE_BACKOFF_START_MS = 5000;
 const SSE_BACKOFF_MAX_MS = 60000;
+const DRAFT_FLUSH_MS = 80; // DOM-Update-Takt beim Delta-Streaming
+const CONV_REFRESH_DELAY_MS = 1500; // Debounce für Listen-Refreshs (Badges)
 
 // Material Design Icons (24x24), eingefärbt über currentColor.
 const ICON_PAPERCLIP =
@@ -39,14 +41,19 @@ class AllroggenChatPanel extends HTMLElement {
     this._conversations = [];
     this._conversation = null; // full conversation with messages
     this._busy = false;
+    this._busyConversationId = null; // Unterhaltung des laufenden Turns — unabhängig von der offenen Ansicht
+    this._busyUserMessageId = null; // User-Nachricht-ID des laufenden Turns (Selbstheilung nach Stream-Lücke)
     this._error = null;
     this._pollTimer = null;
     this._draft = ""; // streamed assistant text, not yet persisted
+    this._draftFlushTimer = null; // drosselt DOM-Updates beim Delta-Streaming
+    this._convRefreshTimer = null; // debounced Refresh der Unterhaltungsliste
     this._mounted = true;
     this._sseOk = false; // stream usable; false → polling fallback on send
     this._sseAbort = null; // AbortController for the current stream fetch
     this._sseBackoff = SSE_BACKOFF_START_MS;
     this._sseReconnectTimer = null;
+    this._healAfterGap = false; // Stream nach Lücke neu verbunden → Zustand nachziehen
     this._pendingImage = null; // { base64, contentType, fileName, previewUrl }
     this._attachmentUrls = new Map(); // messageId → object URL
     this._attachmentPromises = new Map(); // messageId → Promise<object URL>
@@ -68,6 +75,15 @@ class AllroggenChatPanel extends HTMLElement {
         localStorage.getItem("allroggenChat.sidebarCollapsed") === "1";
     } catch (_) {
       this._sidebarCollapsed = false;
+    }
+    try {
+      this._lastSeen = new Map(
+        Object.entries(
+          JSON.parse(localStorage.getItem("allroggenChat.lastSeen") || "{}")
+        )
+      );
+    } catch (_) {
+      this._lastSeen = new Map(); // convId → updatedAt beim letzten Ansehen
     }
   }
 
@@ -91,6 +107,14 @@ class AllroggenChatPanel extends HTMLElement {
     this._mounted = false;
     this._stopPolling();
     this._stopSpeech();
+    if (this._draftFlushTimer) {
+      clearTimeout(this._draftFlushTimer);
+      this._draftFlushTimer = null;
+    }
+    if (this._convRefreshTimer) {
+      clearTimeout(this._convRefreshTimer);
+      this._convRefreshTimer = null;
+    }
     this._clearPendingImage();
     for (const url of this._attachmentUrls.values()) URL.revokeObjectURL(url);
     this._attachmentUrls.clear();
@@ -125,7 +149,16 @@ class AllroggenChatPanel extends HTMLElement {
     }
     try {
       this._config = await this._api("GET", "config");
-      this._conversations = await this._api("GET", "conversations");
+      const conversations = await this._api("GET", "conversations");
+      // Erster Abgleich: Unterhaltungen ohne Seen-Stand gelten als gesehen —
+      // sonst gäbe es beim allerersten Öffnen lauter falsche Badges.
+      for (const c of conversations) {
+        if (c.updatedAt && !this._lastSeen.has(c.id)) {
+          this._lastSeen.set(c.id, c.updatedAt);
+        }
+      }
+      this._lastSeenPersist();
+      this._applyConversations(conversations);
       if (this._conversations.length > 0) {
         await this._openConversation(this._conversations[0].id);
       }
@@ -184,11 +217,18 @@ class AllroggenChatPanel extends HTMLElement {
       }
       this._sseOk = true;
       this._sseBackoff = SSE_BACKOFF_START_MS;
+      // Nach einer Stream-Lücke könnten Events verpasst worden sein —
+      // offene Unterhaltung, eigener Busy-Turn und Liste nachziehen.
+      if (this._healAfterGap) {
+        this._healAfterGap = false;
+        this._healAfterStreamGap();
+      }
       await this._readStream(resp.body);
       throw { status: 0 }; // stream ended cleanly → reconnect below
     } catch (err) {
       if (!this._mounted || abort.signal.aborted) return;
       this._sseOk = false;
+      this._healAfterGap = true;
       // 404 = old backend without the stream endpoint: stay on the polling
       // fallback, but keep retrying (backoff max 60 s) so an upgraded
       // backend is picked up without a page reload.
@@ -205,6 +245,40 @@ class AllroggenChatPanel extends HTMLElement {
     this._sseBackoff = Math.min(this._sseBackoff * 2, SSE_BACKOFF_MAX_MS);
   }
 
+  /**
+   * Nach einer Stream-Unterbrechung verpasste Events nachziehen: offene
+   * Unterhaltung und Liste auffrischen; endete der eigene Turn in der Lücke
+   * (terminales Event kam nie an), ihn anhand der Historie freigeben —
+   * gleiche Erkennungslogik wie der Polling-Fallback.
+   */
+  _healAfterStreamGap() {
+    this._refreshOpenConversation();
+    this._scheduleConversationsRefresh();
+    if (!this._busy || this._busyConversationId == null) return;
+    const busyId = this._busyConversationId;
+    const userId = this._busyUserMessageId || 0;
+    this._api("GET", `conversations/${busyId}`)
+      .then((conv) => {
+        if (!this._busy || this._busyConversationId !== busyId) return;
+        const done = conv.messages.some(
+          (m) =>
+            m.id > userId &&
+            ["assistant", "error"].includes((m.role || "").toLowerCase())
+        );
+        if (!done) return;
+        this._busy = false;
+        this._busyConversationId = null;
+        this._busyUserMessageId = null;
+        this._cancelling = false;
+        this._clearDraft();
+        if (this._conversation && this._conversation.id === busyId) {
+          this._conversation = conv;
+        }
+        this._render();
+      })
+      .catch(() => {});
+  }
+
   async _readStream(body) {
     const reader = body.getReader();
     const decoder = new TextDecoder();
@@ -214,11 +288,15 @@ class AllroggenChatPanel extends HTMLElement {
         const { done, value } = await reader.read();
         if (done) return;
         buffer += decoder.decode(value, { stream: true });
-        let idx;
-        while ((idx = buffer.indexOf("\n\n")) >= 0) {
-          const frame = buffer.slice(0, idx);
-          buffer = buffer.slice(idx + 2);
+        // Frame-Ende kann \n\n oder \r\n\r\n sein (manche Proxies schreiben
+        // CRLF um); ein über Chunk-Grenzen gerissener Separator wird mit dem
+        // nächsten Decode vervollständigt.
+        let sep = /\r?\n\r?\n/.exec(buffer);
+        while (sep) {
+          const frame = buffer.slice(0, sep.index);
+          buffer = buffer.slice(sep.index + sep[0].length);
           this._handleSseFrame(frame);
+          sep = /\r?\n\r?\n/.exec(buffer);
         }
       }
     } finally {
@@ -229,7 +307,7 @@ class AllroggenChatPanel extends HTMLElement {
   _handleSseFrame(frame) {
     let event = "message";
     const dataLines = [];
-    for (const line of frame.split("\n")) {
+    for (const line of frame.split(/\r?\n/)) {
       if (!line || line.startsWith(":")) continue; // heartbeats / comments
       if (line.startsWith("event:")) event = line.slice(6).trim();
       else if (line.startsWith("data:")) dataLines.push(line.slice(5).replace(/^ /, ""));
@@ -245,38 +323,44 @@ class AllroggenChatPanel extends HTMLElement {
   }
 
   _handleSseEvent(event, payload) {
-    if (!payload || !this._conversation) return;
-    if (payload.conversationId !== this._conversation.id) return;
+    if (!payload) return;
+    // Terminale State-Events des laufenden Turns müssen immer verarbeitet
+    // werden — auch wenn der Nutzer inzwischen eine andere Unterhaltung
+    // geöffnet oder eine neue angelegt hat. Sonst bliebe der Composer für
+    // immer gesperrt.
+    if (
+      event === "assistant.state" &&
+      this._busyConversationId != null &&
+      payload.conversationId === this._busyConversationId
+    ) {
+      this._handleTurnState(payload);
+      return;
+    }
+    // Alles weitere rendert nur in die gerade geöffnete Unterhaltung.
+    if (!this._conversation || payload.conversationId !== this._conversation.id) {
+      // Aktivität in einer anderen Unterhaltung (z. B. anderer Tab oder der
+      // laufende Turn nach einem Ansichtswechsel): Liste nachziehen → Badge.
+      if (event === "assistant.message" || event === "assistant.state") {
+        this._scheduleConversationsRefresh();
+      }
+      return;
+    }
     switch (event) {
       case "assistant.delta":
         this._draft += payload.delta || "";
-        this._updateDraftBubble();
+        this._scheduleDraftFlush();
         break;
       case "assistant.message":
         if (payload.message) this._conversation.messages.push(payload.message);
-        this._draft = "";
+        this._clearDraft();
         this._render();
         this._onNewContent();
         break;
       case "assistant.state":
-        if (payload.state === "done" || payload.state === "cancelled") {
-          this._busy = false;
-          this._cancelling = false;
-          this._draft = "";
-          this._render();
-          // Quota/costs and the conversation list moved — refresh both.
-          this._api("GET", "config")
-            .then((c) => { this._config = c; this._render(); })
-            .catch(() => {});
-          this._api("GET", "conversations")
-            .then((l) => { this._conversations = l; this._render(); })
-            .catch(() => {});
-        } else if (payload.state === "error") {
-          this._busy = false;
-          this._cancelling = false;
-          this._draft = "";
-          this._error = payload.error || "Der Agent konnte die Nachricht nicht verarbeiten.";
-          this._render();
+        // Terminal-Event eines fremden Turns (z. B. anderes Browser-Tab):
+        // nur die Ansicht aktualisieren, den eigenen Busy-Zustand nicht anfassen.
+        if (payload.state === "done" || payload.state === "cancelled" || payload.state === "error") {
+          this._refreshOpenConversation();
         }
         break;
       case "assistant.usage":
@@ -288,8 +372,74 @@ class AllroggenChatPanel extends HTMLElement {
     }
   }
 
+  /** Terminalzustand des eigenen Turns: Busy freigeben, Meta-Daten nachziehen. */
+  _handleTurnState(payload) {
+    if (payload.state !== "done" && payload.state !== "cancelled" && payload.state !== "error") {
+      return;
+    }
+    const finishedId = payload.conversationId;
+    this._busy = false;
+    this._busyConversationId = null;
+    this._busyUserMessageId = null;
+    this._cancelling = false;
+    this._clearDraft();
+    if (payload.state === "error") {
+      this._error = payload.error || "Der Agent konnte die Nachricht nicht verarbeiten.";
+    }
+    this._render();
+    // Quota/costs and the conversation list moved — refresh both. The open
+    // conversation is refetched as well, in case an assistant.message event
+    // was missed during a stream reconnect.
+    this._api("GET", "config")
+      .then((c) => { this._config = c; this._render(); })
+      .catch(() => {});
+    this._api("GET", "conversations")
+      .then((l) => { this._applyConversations(l); this._render(); })
+      .catch(() => {});
+    this._refreshOpenConversation(finishedId);
+  }
+
+  /** Offene Unterhaltung neu laden (heilt verpasste SSE-Events). */
+  _refreshOpenConversation(onlyId) {
+    if (!this._conversation) return;
+    const id = onlyId != null ? onlyId : this._conversation.id;
+    if (this._conversation.id !== id) return;
+    this._api("GET", `conversations/${id}`)
+      .then((conv) => {
+        if (this._conversation && this._conversation.id === id) {
+          this._conversation = conv;
+          this._render();
+          this._onNewContent();
+        }
+      })
+      .catch(() => {});
+  }
+
+  /** Draft zurücksetzen (Commit/Abbruch/Wechsel) inkl. ausstehendem Flush-Timer. */
+  _clearDraft() {
+    this._draft = "";
+    if (this._draftFlushTimer) {
+      clearTimeout(this._draftFlushTimer);
+      this._draftFlushTimer = null;
+    }
+  }
+
+  /**
+   * Delta-Streaming drosseln: Token kommen in Bursts — ein innerHTML-Re-Write
+   * plus Scroll pro Token ruckelt bei langen Antworten sichtbar. Die Bulle
+   * wird maximal alle DRAFT_FLUSH_MS ms neu aufgebaut.
+   */
+  _scheduleDraftFlush() {
+    if (this._draftFlushTimer || !this._mounted) return;
+    this._draftFlushTimer = setTimeout(() => {
+      this._draftFlushTimer = null;
+      this._updateDraftBubble();
+    }, DRAFT_FLUSH_MS);
+  }
+
   /** Update the streaming draft bubble in place — no full re-render per token. */
   _updateDraftBubble() {
+    if (!this._draft) return; // leerer Flush nach Commit — nichts tun
     const messages = this.shadowRoot && this.shadowRoot.getElementById("messages");
     if (!messages) return;
     let el = this.shadowRoot.getElementById("draft-bubble");
@@ -317,17 +467,35 @@ class AllroggenChatPanel extends HTMLElement {
   // ---- Conversations -------------------------------------------------------
 
   async _openConversation(id) {
-    this._draft = "";
+    this._clearDraft();
     // Beim Öffnen einer Unterhaltung immer ans Ende springen.
     this._nearBottom = true;
     this._unseenBelow = false;
     this._conversation = await this._api("GET", `conversations/${id}`);
+    // Öffnen markiert alles bis zum aktuellen Listen-Stand als gesehen.
+    const meta = this._conversations.find((c) => c.id === id);
+    if (meta && meta.updatedAt) {
+      this._lastSeen.set(id, meta.updatedAt);
+      this._lastSeenPersist();
+    }
     this._render();
   }
 
+  /** _openConversation mit Fehler-Banner statt unbehandelter Promise-Rejection. */
+  async _openConversationSafe(id) {
+    try {
+      await this._openConversation(id);
+    } catch (err) {
+      this._error = this._describeError(err);
+      this._render();
+    }
+  }
+
   async _newConversation() {
-    this._stopPolling();
-    this._draft = "";
+    // Bewusst KEIN _stopPolling(): Ein laufender Polling-Turn wird weiter
+    // beobachtet — er räumt nur den Busy-Zustand ab und fasst die neue,
+    // leere Ansicht nicht mehr an (siehe _startPolling).
+    this._clearDraft();
     this._conversation = null;
     this._nearBottom = true;
     this._unseenBelow = false;
@@ -346,11 +514,22 @@ class AllroggenChatPanel extends HTMLElement {
       this._render();
       return;
     }
-    this._draft = "";
+    this._clearDraft();
+    this._stopPolling();
+    // Läuft der Turn in der gelöschten Unterhaltung, wird er hier
+    // freigegeben — seine terminalen Events landen sonst ins Leere.
+    if (this._busyConversationId === id) {
+      this._busy = false;
+      this._busyConversationId = null;
+      this._busyUserMessageId = null;
+      this._cancelling = false;
+    }
+    this._lastSeen.delete(id);
+    this._lastSeenPersist();
     this._conversations = this._conversations.filter((c) => c.id !== id);
     this._conversation = null;
     if (this._conversations.length > 0) {
-      await this._openConversation(this._conversations[0].id);
+      await this._openConversationSafe(this._conversations[0].id);
     }
     this._render();
   }
@@ -365,15 +544,20 @@ class AllroggenChatPanel extends HTMLElement {
 
     this._stopSpeech();
     this._busy = true;
+    // Der Turn gehört zu dieser Unterhaltung; bei ganz neuen Unterhaltungen
+    // steht die echte ID erst nach der Antwort fest. Terminale Events darüber
+    // geben den Busy-Zustand frei — egal, was gerade geöffnet ist.
+    this._busyConversationId = this._conversation ? this._conversation.id : null;
     this._error = null;
     this._speechError = null;
-    this._draft = "";
+    this._clearDraft();
     // Eigene Nachricht: immer ans Ende scrollen.
     this._nearBottom = true;
     this._unseenBelow = false;
     input.value = "";
     this._render();
 
+    let result;
     try {
       const body = {
         content,
@@ -384,20 +568,16 @@ class AllroggenChatPanel extends HTMLElement {
         body.imageContentType = image.contentType;
         body.imageFileName = image.fileName;
       }
-      const result = await this._api("POST", "messages", body);
+      result = await this._api("POST", "messages", body);
       this._clearPendingImage();
+      this._busyConversationId = result.conversationId;
+      this._busyUserMessageId =
+        result.userMessageId != null ? result.userMessageId : null;
       await this._openConversation(result.conversationId);
-      // Refresh the conversation list (title / ordering may have changed).
-      this._conversations = await this._api("GET", "conversations");
-      if (this._sseOk) {
-        // The answer arrives via assistant.delta/message/state events —
-        // no polling, no timeout needed. _busy clears on state=done/error.
-        this._render();
-      } else {
-        this._startPolling(result.conversationId, result.userMessageId);
-      }
     } catch (err) {
       this._busy = false;
+      this._busyConversationId = null;
+      this._busyUserMessageId = null;
       if (err && err.status === 429 && err.body && err.body.quota) {
         const q = err.body.quota;
         const reset = new Date(q.resetsAt).toLocaleDateString("de-DE");
@@ -407,7 +587,27 @@ class AllroggenChatPanel extends HTMLElement {
         this._error = this._describeError(err);
       }
       this._render();
+      return;
     }
+    // Refresh the conversation list (title / ordering may have changed) —
+    // entkoppelt vom Turn: Schlägt er fehl, ist die Nachricht trotzdem raus,
+    // und das Antwort-Tracking (SSE/Polling) darf nicht abgebrochen werden.
+    this._api("GET", "conversations")
+      .then((l) => { this._applyConversations(l); this._render(); })
+      .catch(() => {});
+    if (this._sseOk) {
+      // The answer arrives via assistant.delta/message/state events —
+      // no polling, no timeout needed. _busy clears on state=done/error.
+      this._render();
+    } else {
+      this._startPolling(result.conversationId, result.userMessageId);
+    }
+  }
+
+  /** Composer-Textarea passend zum Inhalt wachsen lassen (max. 132 px). */
+  _autoGrow(el) {
+    el.style.height = "auto";
+    el.style.height = `${Math.min(el.scrollHeight, 132)}px`;
   }
 
   _startPolling(conversationId, afterMessageId) {
@@ -424,20 +624,33 @@ class AllroggenChatPanel extends HTMLElement {
       }
       try {
         const conv = await this._api("GET", `conversations/${conversationId}`);
+        // Rollen case-insensitive prüfen: SSE liefert "tool", die Historie
+        // "Tool" — das Terminal-Ereignis darf davon nicht abhängen.
         const done = conv.messages.some(
           (m) =>
             m.id > afterMessageId &&
-            (m.role === "Assistant" || m.role === "Error")
+            ["assistant", "error"].includes((m.role || "").toLowerCase())
         );
         if (done) {
           this._stopPolling();
           this._busy = false;
+          this._busyConversationId = null;
+          this._busyUserMessageId = null;
           this._cancelling = false;
-          this._conversation = conv;
+          // Nur in die Ansicht übernehmen, wenn die Unterhaltung noch
+          // geöffnet ist — sonst wird der Turn still abgeräumt.
+          if (this._conversation && this._conversation.id === conversationId) {
+            this._conversation = conv;
+            this._onNewContent();
+          }
           // Quota may have moved — refresh config in the background.
-          this._api("GET", "config").then((c) => { this._config = c; this._render(); });
+          this._api("GET", "config")
+            .then((c) => { this._config = c; this._render(); })
+            .catch(() => {});
+          this._api("GET", "conversations")
+            .then((l) => { this._applyConversations(l); this._render(); })
+            .catch(() => {});
           this._render();
-          this._onNewContent();
         }
       } catch (_) { /* keep polling on transient errors */ }
     }, POLL_INTERVAL_MS);
@@ -512,11 +725,13 @@ class AllroggenChatPanel extends HTMLElement {
   // ---- Abbrechen -------------------------------------------------------------
 
   async _cancel() {
-    if (!this._conversation || !this._busy || this._cancelling) return;
+    if (this._busyConversationId == null || !this._busy || this._cancelling) return;
     this._cancelling = true;
     this._render();
     try {
-      await this._api("POST", `conversations/${this._conversation.id}/cancel`);
+      // Abbrechen zielt immer auf die Unterhaltung des laufenden Turns,
+      // auch wenn der Nutzer inzwischen eine andere geöffnet hat.
+      await this._api("POST", `conversations/${this._busyConversationId}/cancel`);
       // _busy bleibt bestehen, bis das terminale Event eintrifft (SSE
       // assistant.state cancelled/done/error bzw. die persistierte
       // Abbruch-Nachricht im Polling-Fallback).
@@ -634,7 +849,10 @@ class AllroggenChatPanel extends HTMLElement {
         else interim += r[0].transcript;
       }
       const el = this.shadowRoot.getElementById("msg");
-      if (el) el.value = this._speechBase + this._speechFinal + interim;
+      if (el) {
+        el.value = this._speechBase + this._speechFinal + interim;
+        this._autoGrow(el);
+      }
     };
     rec.onerror = (e) => {
       this._speechError =
@@ -733,7 +951,52 @@ class AllroggenChatPanel extends HTMLElement {
       this._render();
       return;
     }
-    this._openConversation(id);
+    this._openConversationSafe(id);
+  }
+
+  // ---- Ungesehene Aktivität (Badges) ----------------------------------------
+
+  _lastSeenPersist() {
+    try {
+      localStorage.setItem(
+        "allroggenChat.lastSeen",
+        JSON.stringify(Object.fromEntries(this._lastSeen))
+      );
+    } catch (_) { /* localStorage nicht verfügbar */ }
+  }
+
+  /** Conversations-Liste übernehmen; die offene Unterhaltung gilt als gesehen. */
+  _applyConversations(list) {
+    this._conversations = list;
+    if (this._conversation) {
+      const open = list.find((c) => c.id === this._conversation.id);
+      if (open && open.updatedAt) {
+        this._lastSeen.set(open.id, open.updatedAt);
+        this._lastSeenPersist();
+      }
+    }
+  }
+
+  /** true, wenn es seit dem letzten Ansehen Aktivität in der Unterhaltung gab. */
+  _hasUnseen(c) {
+    if (!c.updatedAt) return false;
+    const seen = this._lastSeen.get(c.id);
+    return seen !== undefined && c.updatedAt > seen;
+  }
+
+  _unseenCount() {
+    return this._conversations.filter((c) => this._hasUnseen(c)).length;
+  }
+
+  /** Debounced Refresh der Liste (Aktivität in anderen Unterhaltungen). */
+  _scheduleConversationsRefresh() {
+    if (this._convRefreshTimer || !this._mounted) return;
+    this._convRefreshTimer = setTimeout(() => {
+      this._convRefreshTimer = null;
+      this._api("GET", "conversations")
+        .then((l) => { this._applyConversations(l); this._render(); })
+        .catch(() => {});
+    }, CONV_REFRESH_DELAY_MS);
   }
 
   /** Kurzdatum der letzten Aktivität einer Unterhaltung („06.08., 14:32“). */
@@ -743,7 +1006,8 @@ class AllroggenChatPanel extends HTMLElement {
     if (isNaN(d.getTime())) return "";
     const date = d.toLocaleDateString("de-DE", { day: "2-digit", month: "2-digit" });
     const time = d.toLocaleTimeString("de-DE", { hour: "2-digit", minute: "2-digit" });
-    return `<div class="conv-date">${date}, ${time}</div>`;
+    const unseen = this._hasUnseen(c) ? ` <span class="conv-new">neu</span>` : "";
+    return `<div class="conv-date">${date}, ${time}${unseen}</div>`;
   }
 
   _sidebarHtml() {
@@ -770,18 +1034,69 @@ class AllroggenChatPanel extends HTMLElement {
 
   // ---- Rendering -----------------------------------------------------------
 
+  /** Escaping für Text- UND Attribut-Kontexte — Anführungszeichen gehören dazu. */
   _esc(s) {
     return String(s)
-      .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+      .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
   }
 
-  /** Markdown-light: bold, italic, inline code, line breaks. Input is escaped first. */
+  /**
+   * Markdown-light: Code-Blöcke, Listen, bold, italic, inline code, Umbrüche.
+   * Der Input wird zuerst komplett escapet, dann zeilenweise strukturiert.
+   */
   _md(s) {
-    return this._esc(s)
+    const inline = (t) => t
       .replace(/`([^`]+)`/g, "<code>$1</code>")
       .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
-      .replace(/\*([^*]+)\*/g, "<em>$1</em>")
-      .replace(/\n/g, "<br>");
+      .replace(/\*([^*]+)\*/g, "<em>$1</em>");
+    const out = [];
+    let listTag = null; // "ul" | "ol" — aktuell offene Liste
+    let listItems = [];
+    let code = null; // Inhalt eines offenen ```-Codeblocks
+    const closeList = () => {
+      if (listTag) {
+        out.push(`<${listTag}>${listItems.join("")}</${listTag}>`);
+        listTag = null;
+        listItems = [];
+      }
+    };
+    for (const line of this._esc(s).split("\n")) {
+      if (code !== null) {
+        if (/^\s*```/.test(line)) {
+          // &#10; statt \n — die globale Umbruch-Ersetzung unten darf den
+          // Code-Inhalt nicht anfassen; im Browser wird &#10; innerhalb
+          // von pre wieder als Zeilenumbruch gerendert.
+          out.push(`<pre><code>${code.replace(/\n$/, "").replace(/\n/g, "&#10;")}</code></pre>`);
+          code = null;
+        } else {
+          code += `${line}\n`;
+        }
+        continue;
+      }
+      if (/^\s*```/.test(line)) {
+        closeList();
+        code = "";
+        continue;
+      }
+      const ul = line.match(/^\s*[-*] +(.*)$/);
+      const ol = line.match(/^\s*\d+[.)] +(.*)$/);
+      if (ul) {
+        if (listTag !== "ul") { closeList(); listTag = "ul"; }
+        listItems.push(`<li>${inline(ul[1])}</li>`);
+      } else if (ol) {
+        if (listTag !== "ol") { closeList(); listTag = "ol"; }
+        listItems.push(`<li>${inline(ol[1])}</li>`);
+      } else {
+        closeList();
+        out.push(inline(line));
+      }
+    }
+    closeList();
+    if (code !== null) {
+      out.push(`<pre><code>${code.replace(/\n$/, "").replace(/\n/g, "&#10;")}</code></pre>`);
+    }
+    return out.join("\n").replace(/\n/g, "<br>");
   }
 
   /** Kontingent-Ring im Header: nur Prozent, keine Euro-Werte. */
@@ -913,6 +1228,10 @@ class AllroggenChatPanel extends HTMLElement {
     const noAgent = this._config && !this._config.enabled;
     const quotaExceeded = this._config && this._config.quota && this._config.quota.exceeded;
     const inputDisabled = this._busy || noAgent || quotaExceeded;
+    // Zähler für Unterhaltungen mit ungelesener Aktivität (wie der
+    // Reparaturen-Zähler — nur eben im Panel, HA-Seitenleiste bietet dafür
+    // für Custom Panels keine Badge-API).
+    const unseenCount = this._unseenCount();
 
     const wrapClasses = [
       "wrap",
@@ -964,6 +1283,7 @@ class AllroggenChatPanel extends HTMLElement {
         .conv-title { font-size: 13px; font-weight: 500; color: var(--primary-text-color, #222); display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
         .conv-card.active .conv-title { padding-right: 20px; }
         .conv-date { font-size: 11px; color: var(--secondary-text-color, #888); margin-top: 4px; }
+        .conv-new { display: inline-block; margin-left: 6px; padding: 1px 7px; border-radius: 999px; background: var(--error-color, #db4437); color: #fff; font-size: 10px; font-weight: 600; vertical-align: 1px; }
         .conv-del { position: absolute; top: 6px; right: 6px; width: 22px; height: 22px; border-radius: 50%; background: transparent; color: var(--secondary-text-color, #888); font-size: 11px; display: flex; align-items: center; justify-content: center; }
         .conv-del:hover { background: #fdecea; color: #b71c1c; }
         .conv-empty { font-size: 12px; color: var(--secondary-text-color, #888); text-align: center; padding: 16px 8px; }
@@ -990,6 +1310,9 @@ class AllroggenChatPanel extends HTMLElement {
         .bubble.draft { opacity: 0.85; }
         .bubble.error { background: #fdecea; color: #b71c1c; border-color: #f5c6c0; box-shadow: none; }
         .bubble code { font-family: monospace; background: rgba(127,127,127,0.15); padding: 1px 4px; border-radius: 4px; }
+        .bubble pre { background: rgba(127,127,127,0.15); padding: 8px 10px; border-radius: 8px; overflow-x: auto; white-space: pre-wrap; margin: 6px 0; }
+        .bubble pre code { background: transparent; padding: 0; }
+        .bubble ul, .bubble ol { margin: 6px 0; padding-left: 20px; }
         .meta { font-size: 11px; color: var(--secondary-text-color, #888); margin: 2px 6px 0; }
         .bubble.typing { display: inline-flex; gap: 5px; align-items: center; padding: 13px 16px; }
         .bubble.typing .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--secondary-text-color, #999); animation: typing-bounce 1.2s infinite; }
@@ -1014,9 +1337,11 @@ class AllroggenChatPanel extends HTMLElement {
         /* Composer */
         .composer { display: flex; align-items: center; gap: 4px; padding: 6px; border-radius: 24px; border: 1px solid var(--divider-color, #ddd); background: var(--card-background-color, #fff); box-shadow: 0 1px 4px rgba(0,0,0,0.08); }
         .composer:focus-within { border-color: var(--primary-color, #03a9f4); }
-        .composer input#msg { flex: 1; min-width: 0; border: none; background: transparent; padding: 8px 10px; font-size: 14px; color: var(--primary-text-color, #222); }
-        .composer input#msg:focus, .composer input#msg:focus-visible { outline: none; }
+        .composer textarea#msg { flex: 1; min-width: 0; border: none; background: transparent; padding: 8px 10px; font-size: 14px; font-family: inherit; line-height: 1.45; color: var(--primary-text-color, #222); resize: none; height: 36px; max-height: 132px; overflow-y: auto; }
+        .composer textarea#msg:focus, .composer textarea#msg:focus-visible { outline: none; }
         .icon-btn { width: 36px; height: 36px; flex-shrink: 0; border-radius: 50%; background: transparent; color: var(--secondary-text-color, #666); font-size: 17px; display: flex; align-items: center; justify-content: center; }
+        .icon-btn.badged { position: relative; }
+        .toggle-badge { position: absolute; top: 1px; right: 1px; min-width: 15px; height: 15px; padding: 0 4px; border-radius: 999px; background: var(--error-color, #db4437); color: #fff; font-size: 10px; font-weight: 600; line-height: 15px; text-align: center; box-sizing: border-box; }
         .icon-btn:hover:not(:disabled) { background: var(--secondary-background-color, #eee); }
         .icon-btn.recording { background: #d32f2f; color: #fff; animation: mic-pulse 1.2s infinite; }
         @keyframes mic-pulse { 0% { opacity: 1; } 50% { opacity: 0.55; } 100% { opacity: 1; } }
@@ -1037,8 +1362,8 @@ class AllroggenChatPanel extends HTMLElement {
           ${this._narrow || this._haNarrow
             ? `<ha-menu-button class="ha-menu" narrow></ha-menu-button>`
             : ""}
-          <button type="button" class="icon-btn" id="conv-toggle" title="Unterhaltungen ein-/ausblenden">${ICON_FORUM}</button>
-          <div class="avatar"><img src="/allroggen_chat_static/logo.svg" alt="" onerror="this.outerHTML='${this._esc(agentName.trim().charAt(0).toUpperCase() || "?")}'"></div>
+          <button type="button" class="icon-btn badged" id="conv-toggle" title="Unterhaltungen ein-/ausblenden">${ICON_FORUM}${unseenCount > 0 ? `<span class="toggle-badge">${unseenCount > 9 ? "9+" : unseenCount}</span>` : ""}</button>
+          <div class="avatar"><img id="avatar-img" src="/allroggen_chat_static/logo.svg" alt="" /></div>
           <div class="header-text">
             <h1>${this._esc(agentName)}</h1>
           </div>
@@ -1056,7 +1381,7 @@ class AllroggenChatPanel extends HTMLElement {
               <div class="messages" id="messages">
                 ${this._messagesHtml()}
                 ${this._draft ? `<div class="msg assistant" id="draft-bubble"><div class="bubble draft">${this._md(this._draft)}</div></div>` : ""}
-                ${this._busy && !this._draft ? `
+                ${this._busy && !this._draft && this._conversation && this._conversation.id === this._busyConversationId ? `
                   <div class="msg assistant busy">
                     <div class="bubble typing" title="${this._cancelling ? "Wird abgebrochen…" : "Der Agent arbeitet…"}"><span class="dot"></span><span class="dot"></span><span class="dot"></span></div>
                     ${this._cancelling ? `<div class="meta">Wird abgebrochen…</div>` : ""}
@@ -1075,8 +1400,8 @@ class AllroggenChatPanel extends HTMLElement {
               <input type="file" id="imgfile" accept="image/*" hidden />
               <button type="button" class="icon-btn" id="attach" title="Bild anhängen" ${inputDisabled ? "disabled" : ""}>${ICON_PAPERCLIP}</button>
               ${this._speechSupported() ? `<button type="button" class="icon-btn ${this._recording ? "recording" : ""}" id="mic" title="Spracheingabe" ${inputDisabled ? "disabled" : ""}>${ICON_MIC}</button>` : ""}
-              <input id="msg" placeholder="Nachricht schreiben…" ${inputDisabled ? "disabled" : ""} />
-              ${this._busy && this._conversation
+              <textarea id="msg" rows="1" placeholder="Nachricht schreiben…" ${inputDisabled ? "disabled" : ""}></textarea>
+              ${this._busy && this._busyConversationId != null
                 ? `<button type="button" class="cancel-btn" id="cancel" ${this._cancelling ? "disabled" : ""}>Abbrechen</button>`
                 : `<button type="button" class="send-btn" id="send" title="Senden" ${inputDisabled ? "disabled" : ""}>${ICON_SEND}</button>`}
             </div>
@@ -1101,9 +1426,24 @@ class AllroggenChatPanel extends HTMLElement {
     if (mic) mic.addEventListener("click", () => this._toggleSpeech());
     const msgInput = this.shadowRoot.getElementById("msg");
     if (prevValue) msgInput.value = prevValue;
-    if (hadFocus && !msgInput.disabled) msgInput.focus();
+    this._autoGrow(msgInput);
+    if (hadFocus && !msgInput.disabled) {
+      msgInput.focus();
+      msgInput.selectionStart = msgInput.selectionEnd = msgInput.value.length;
+    }
+    msgInput.addEventListener("input", () => this._autoGrow(msgInput));
     msgInput.addEventListener("keydown", (e) => {
-      if (e.key === "Enter") this._send();
+      // Enter sendet, Umschalt+Enter macht einen Zeilenumbruch; während
+      // einer IME-Komposition (isComposing) darf Enter nicht senden.
+      if (e.key === "Enter" && !e.shiftKey && !e.isComposing) {
+        e.preventDefault();
+        this._send();
+      }
+    });
+    const avatarImg = this.shadowRoot.getElementById("avatar-img");
+    avatarImg.addEventListener("error", () => {
+      // Logo nicht ladbar → Initial des Agenten-Namens als Fallback.
+      avatarImg.outerHTML = this._esc(agentName.trim().charAt(0).toUpperCase() || "?");
     });
     this.shadowRoot.getElementById("conv-toggle").addEventListener("click", () => this._toggleSidebar());
     this.shadowRoot.getElementById("new").addEventListener("click", () => this._newConversation());

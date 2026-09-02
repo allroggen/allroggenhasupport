@@ -28,6 +28,7 @@ Home Assistant des Kunden arbeiten (Automationen, Dashboards, Helfer).
 | 🖼️ **Bild-Upload** | Per 📎-Button Bilder anhängen (clientseitig verkleinert, max. 1600 px). Erfordert ein vision-fähiges Chat-Modell im Ticket-System — der voreingestellte MiniMax-M2 ist reine Text-KI und ignoriert Anhänge |
 | 🎤 **Spracheingabe** | Diktieren statt tippen (Web Speech API, Deutsch). Erfordert Chrome oder Edge — in Firefox wird der Button nicht angezeigt |
 | ⏹️ **Abbrechen** | Ein laufender Turn lässt sich jederzeit per „Abbrechen"-Button stoppen |
+| 🔔 **Ungesehene Antworten** | Roter Zähler am Unterhaltungs-Button und „neu"-Markierung pro Unterhaltung, wenn Antworten oder Rückfragen noch ungelesen sind — auch über Sitzungen hinweg |
 | 📊 **Kontingent im Blick** | Prozent-Ring fürs Monatskontingent und Tokensumme pro Unterhaltung — ganz ohne Preise |
 | 🔒 **Datenschutz** | Das Kunden-Token bleibt serverseitig — es erreicht nie den Browser |
 
