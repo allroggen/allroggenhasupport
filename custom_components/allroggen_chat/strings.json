@@ -5,7 +5,7 @@
         "title": "Allroggen Support-Chat einrichten",
         "description": "Backend-Adresse und Integrations-Token eintragen. Beides erhältst du von deinem Dienstleister (Kunden-Detail → Home-Assistant-Chat).",
         "data": {
-          "backend_url": "Backend-Adresse (z. B. https://ticket.example.com)",
+          "backend_url": "Backend-Adresse (vollständige URL mit http/https)",
           "api_token": "Integrations-Token"
         }
       },

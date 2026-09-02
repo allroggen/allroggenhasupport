@@ -5,7 +5,7 @@
         "title": "Set up Allroggen support chat",
         "description": "Enter the backend address and the integration token provided by your service partner.",
         "data": {
-          "backend_url": "Backend URL (e.g. https://ticket.example.com)",
+          "backend_url": "Backend URL (full URL with http/https)",
           "api_token": "Integration token"
         }
       },
