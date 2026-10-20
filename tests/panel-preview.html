@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="de">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Support-Chat · lokale UI-Testdaten</title>
+<style>
+  :root { color-scheme: dark; --header-height: 0px; --primary-color: #ffa000; --primary-text-color: #e8eaed; --secondary-text-color: #b1b5bd; --card-background-color: #202124; --secondary-background-color: #303238; --divider-color: #484b52; --error-color: #ef7770; }
+  body { margin: 0; background: #282a2d; color: var(--primary-text-color); font: 15px system-ui, sans-serif; }
+</style>
+<allroggen-chat-panel></allroggen-chat-panel>
+<script type="module">
+  import "../custom_components/allroggen_chat/panel/allroggen-chat-panel.js";
+  const panel = document.querySelector("allroggen-chat-panel");
+  panel._hass = { auth: { data: { access_token: "local-fixture" } } };
+  panel._config = { enabled: true, assistantName: "Allroggen Support", modelName: "oh-orchestrator", providerName: "Omni-Route-Burg", quota: { includedMonthlyEur: 0, includedRemainingEur: 0, creditRemainingEur: 21.79, costLimit: 0, currency: "EUR", resetsAt: "2026-11-01" } };
+  panel._sseOk = true;
+  panel._conversation = { id: 1, title: "Flurlicht am Morgen", usage: { totalTokens: 69242 }, messages: [
+    { id: 1, role: "assistant", content: "Ich habe diese Automationen gefunden:\n\n1. **Flur Licht Bewegung Nacht** – aktiv\n2. **Flur Licht Sonnenaufgang** – ausgeschaltet\n3. **Flur Licht Nachtlicht** – aktiv\n\nWelche möchtest du anpassen?", sentAt: "2026-10-20T10:15:00Z" },
+    { id: 2, role: "user", content: "Das Licht, das morgens um 5 Uhr angeht.", sentAt: "2026-10-20T10:17:00Z" },
+    { id: 3, role: "error", content: "HTTP 503 (service_unavailable: ALL_TARGETS_SKIPPED)\n\nService temporarily unavailable: all targets were skipped by pre-dispatch filters", sentAt: "2026-10-20T10:17:01Z" }
+  ] };
+  panel._conversations = [{ id: 1, title: "Flurlicht am Morgen", updatedAt: "2026-10-20T10:17:01Z" }, { id: 2, title: "Heizung im Büro", updatedAt: "2026-10-19T08:00:00Z" }];
+  panel._api = async (method, path, body) => {
+    if (path === "conversations") return panel._conversations;
+    if (path.endsWith("/rename")) return null;
+    if (path === "config") return panel._config;
+    if (method === "GET") return { ...panel._conversation, id: Number(path.split("/")[1]) };
+    throw { status: 503 };
+  };
+  new ResizeObserver(([entry]) => { panel._narrow = entry.contentRect.width < 640; panel._render(); }).observe(panel);
+  panel._render();
+</script>
+</html>

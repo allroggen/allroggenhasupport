@@ -48,6 +48,11 @@ class AllroggenChatPanel extends HTMLElement {
     this._busyConversationId = null; // Unterhaltung des laufenden Turns — unabhängig von der offenen Ansicht
     this._busyUserMessageId = null; // User-Nachricht-ID des laufenden Turns (Selbstheilung nach Stream-Lücke)
     this._error = null;
+    this._detailsOpen = false;
+    this._search = "";
+    this._menuOpen = false;
+    this._restoredText = null;
+    this._forking = false;
     this._pollTimer = null;
     this._draft = ""; // streamed assistant text, not yet persisted
     this._draftFlushTimer = null; // drosselt DOM-Updates beim Delta-Streaming
@@ -221,13 +226,32 @@ class AllroggenChatPanel extends HTMLElement {
   }
 
   _describeError(err) {
+    if (err && err.status === 503 && err.body?.error === "not_configured") {
+      return "Die Chat-Integration ist nicht geladen. Bitte prüfe sie unter Einstellungen → Geräte & Dienste.";
+    }
+    if (err && err.status === 503) return "Der KI-Dienst ist momentan nicht verfügbar. Bitte später erneut versuchen.";
+    if (err && err.status === 403) return "Für diese Aktion fehlt die Berechtigung. Bitte kontaktiere den Support.";
+    if (err && err.status === 404) return "Die Unterhaltung ist nicht mehr verfügbar. Bitte öffne eine andere Unterhaltung.";
+    if (err && err.status === 409) return "Diese Unterhaltung wird bereits bearbeitet. Bitte warte auf die Antwort.";
+    if (err && err.status === 429) return "Das Anfragelimit ist erreicht. Bitte warte kurz und versuche es erneut.";
+    if (err && err.status === 400) return "Die Anfrage konnte nicht angenommen werden. Bitte prüfe deine Eingabe.";
     if (err && err.status === 401) {
       return "Zugang ungültig — das Integrations-Token wurde widerrufen oder ist abgelaufen. Bitte in den Integrationseinstellungen ein neues Token eintragen.";
     }
     if (err && err.status === 502) {
       return "Das Support-Backend ist gerade nicht erreichbar. Bitte später erneut versuchen.";
     }
-    return "Verbindungsfehler. Bitte Seite neu laden.";
+    return "Die Verbindung zum Support wurde unterbrochen. Bitte prüfe deine Verbindung und versuche es später erneut.";
+  }
+
+  /** Auch historische Providerfehler bekommen eine verständliche Zusammenfassung. */
+  _friendlyError(text) {
+    const raw = String(text || "");
+    if (/ALL_TARGETS_SKIPPED|pre-dispatch filters/i.test(raw)) {
+      return "Der KI-Dienst hat gerade kein verfügbares Modell für diese Anfrage. Bitte versuche es später erneut. Bleibt das Problem bestehen, kontaktiere den Support mit dem Fehlercode ALL_TARGETS_SKIPPED.";
+    }
+    if (/HTTP 50[234]|service_unavailable/i.test(raw)) return "Der KI-Dienst ist momentan nicht verfügbar. Bitte versuche es später erneut.";
+    return raw || "Die Anfrage konnte nicht verarbeitet werden. Bitte kontaktiere den Support.";
   }
 
   // ---- SSE stream ----------------------------------------------------------
@@ -248,6 +272,7 @@ class AllroggenChatPanel extends HTMLElement {
         throw { status: resp.status };
       }
       this._sseOk = true;
+      this._render();
       this._sseBackoff = SSE_BACKOFF_START_MS;
       // Nach einer Stream-Lücke könnten Events verpasst worden sein —
       // offene Unterhaltung, eigener Busy-Turn und Liste nachziehen.
@@ -261,6 +286,10 @@ class AllroggenChatPanel extends HTMLElement {
       if (!this._mounted || abort.signal.aborted) return;
       this._sseOk = false;
       this._healAfterGap = true;
+      if (this._busy && this._busyConversationId != null && this._busyUserMessageId != null && !this._pollTimer) {
+        this._startPolling(this._busyConversationId, this._busyUserMessageId);
+      }
+      this._render();
       // 404 = old backend without the stream endpoint: stay on the polling
       // fallback, but keep retrying (backoff max 60 s) so an upgraded
       // backend is picked up without a page reload.
@@ -291,13 +320,14 @@ class AllroggenChatPanel extends HTMLElement {
     const userId = this._busyUserMessageId || 0;
     this._api("GET", `conversations/${busyId}`)
       .then((conv) => {
-        if (!this._busy || this._busyConversationId !== busyId) return;
+        if (!this._busy || this._busyConversationId !== busyId || (this._busyUserMessageId || 0) !== userId) return;
         const done = conv.messages.some(
           (m) =>
             m.id > userId &&
             ["assistant", "error"].includes((m.role || "").toLowerCase())
         );
         if (!done) return;
+        this._stopPolling();
         this._busy = false;
         this._busyConversationId = null;
         this._busyUserMessageId = null;
@@ -383,7 +413,7 @@ class AllroggenChatPanel extends HTMLElement {
         this._scheduleDraftFlush();
         break;
       case "assistant.message":
-        if (payload.message) this._conversation.messages.push(payload.message);
+        if (payload.message && !this._conversation.messages.some((m) => m.id === payload.message.id)) this._conversation.messages.push(payload.message);
         this._clearDraft();
         this._render();
         this._onNewContent();
@@ -410,13 +440,14 @@ class AllroggenChatPanel extends HTMLElement {
       return;
     }
     const finishedId = payload.conversationId;
+    this._stopPolling();
     this._busy = false;
     this._busyConversationId = null;
     this._busyUserMessageId = null;
     this._cancelling = false;
     this._clearDraft();
     if (payload.state === "error") {
-      this._error = payload.error || "Der Agent konnte die Nachricht nicht verarbeiten.";
+      this._error = this._friendlyError(payload.error);
     }
     this._render();
     // Quota/costs and the conversation list moved — refresh both. The open
@@ -529,6 +560,8 @@ class AllroggenChatPanel extends HTMLElement {
     // leere Ansicht nicht mehr an (siehe _startPolling).
     this._clearDraft();
     this._conversation = null;
+    this._error = null;
+    this._menuOpen = false;
     this._nearBottom = true;
     this._unseenBelow = false;
     this._drawerOpen = false;
@@ -547,10 +580,10 @@ class AllroggenChatPanel extends HTMLElement {
       return;
     }
     this._clearDraft();
-    this._stopPolling();
     // Läuft der Turn in der gelöschten Unterhaltung, wird er hier
     // freigegeben — seine terminalen Events landen sonst ins Leere.
     if (this._busyConversationId === id) {
+      this._stopPolling();
       this._busy = false;
       this._busyConversationId = null;
       this._busyUserMessageId = null;
@@ -568,11 +601,95 @@ class AllroggenChatPanel extends HTMLElement {
 
   // ---- Sending + polling fallback -------------------------------------------
 
+  async _refreshHistory() {
+    try {
+      const list = await this._api("GET", "conversations");
+      this._applyConversations(list);
+      const id = this._conversation?.id || list[0]?.id;
+      if (id != null) await this._openConversation(id);
+      this._error = null;
+    } catch (err) { this._error = this._describeError(err); }
+    this._render();
+  }
+
+  async _renameConversation() {
+    const conversation = this._conversation;
+    if (!conversation) return;
+    const title = prompt("Titel der Unterhaltung (maximal 60 Zeichen)", conversation.title);
+    if (title == null || !title.trim()) return;
+    if (title.trim().length > 60) { this._error = "Der Titel darf höchstens 60 Zeichen lang sein."; this._render(); return; }
+    try {
+      await this._api("POST", `conversations/${conversation.id}/rename`, { title: title.trim() });
+      conversation.title = title.trim();
+      const item = this._conversations.find((c) => c.id === conversation.id);
+      if (item) item.title = title.trim();
+      this._menuOpen = false;
+    } catch (err) { this._error = this._describeError(err); }
+    this._render();
+  }
+
+  /** Bewusst nur bearbeiten: keine automatische Wiederholung von HA-Aktionen. */
+  _reuseQuestion() {
+    if (this._busy) return;
+    const message = [...(this._conversation?.messages || [])].reverse().find((m) => m.role?.toLowerCase() === "user");
+    if (!message) return;
+    const input = this.shadowRoot.getElementById("msg");
+    if (input.value && !confirm("Aktuellen Entwurf durch die letzte Frage ersetzen?")) return;
+    this._restoredText = message.content;
+    this._menuOpen = false;
+    if (message.hasAttachment) this._error = "Bitte hänge das Bild bei Bedarf erneut an.";
+    this._render();
+    this.shadowRoot.getElementById("msg").focus();
+  }
+
+  _creditLabel() {
+    const q = this._config?.quota;
+    const included = this._toNum(q?.includedRemainingEur);
+    const credit = this._toNum(q?.creditRemainingEur);
+    return included != null && credit != null
+      ? `Verfügbar: ${this._esc(this._eur(included + credit, q.currency))}`
+      : "KI-Guthaben";
+  }
+
+  async _copyMessage(id, button) {
+    const message = this._conversation?.messages.find((m) => m.id === id);
+    if (!message) return;
+    try {
+      await navigator.clipboard.writeText(message.content || "");
+      button.textContent = "Kopiert ✓";
+      button.setAttribute("aria-label", "Nachricht kopiert");
+    } catch (_) {
+      this._error = "Kopieren ist im Browser nicht erlaubt. Bitte markiere den Nachrichtentext und kopiere ihn manuell.";
+      this._render();
+    }
+  }
+
+  async _forkConversation(messageId) {
+    if (this._busy || this._forking || !this._conversation) return;
+    if (!confirm("Neue Unterhaltung mit dem Verlauf bis einschließlich dieser Nachricht starten? Der ursprüngliche Chat bleibt erhalten. Bereits ausgeführte Änderungen in Home Assistant werden NICHT rückgängig gemacht.")) return;
+    const id = this._conversation.id;
+    this._forking = true;
+    this._render();
+    try {
+      const result = await this._api("POST", `conversations/${id}/fork`, { messageId });
+      this._error = "Neue Unterhaltung erstellt. Du kannst hier weiterschreiben. Änderungen in Home Assistant bleiben bestehen.";
+      await this._openConversation(result.conversationId);
+      this._applyConversations(await this._api("GET", "conversations"));
+    } catch (err) {
+      this._error = err?.status === 404 ? "Diese Funktion benötigt ein aktuelles Support-Backend." : this._describeError(err);
+      if (!err?.status || err.status >= 500) this._error += " Bitte prüfe die Unterhaltungsliste vor einem erneuten Versuch; die Fortsetzung könnte bereits erstellt worden sein.";
+    } finally { this._forking = false; this._render(); }
+  }
+
+  _messageActionsHtml(m) {
+    return `<div class="message-actions"><button type="button" class="message-action" data-copy="${m.id}" aria-label="Nachricht kopieren">Kopieren</button><button type="button" class="message-action" data-fork="${m.id}" title="Neue Unterhaltung bis zu dieser Nachricht · keine HA-Änderungen rückgängig machen" ${this._busy || this._forking ? "disabled" : ""}>Ab hier neu starten</button></div>`;
+  }
+
   async _send() {
     const input = this.shadowRoot.getElementById("msg");
     const content = (input.value || "").trim();
     const image = this._pendingImage;
-    if ((!content && !image) || this._busy) return;
+    if ((!content && !image) || this._busy || this._forking || !this._config?.enabled || this._config?.quota?.exceeded) return;
 
     this._stopSpeech();
     this._busy = true;
@@ -605,7 +722,6 @@ class AllroggenChatPanel extends HTMLElement {
       this._busyConversationId = result.conversationId;
       this._busyUserMessageId =
         result.userMessageId != null ? result.userMessageId : null;
-      await this._openConversation(result.conversationId);
     } catch (err) {
       this._busy = false;
       this._busyConversationId = null;
@@ -623,22 +739,32 @@ class AllroggenChatPanel extends HTMLElement {
       } else {
         this._error = this._describeError(err);
       }
+      // Ein Netz-/Serverfehler beweist nicht, dass die Nachricht abgelehnt wurde.
+      // Entwurf behalten, aber niemals automatisch erneut absenden.
+      if (!err?.status || err.status >= 500) {
+        this._error += " Der Versandstatus ist unklar. Prüfe zuerst den Verlauf, bevor du erneut sendest.";
+        this._api("GET", "conversations").then((list) => { this._applyConversations(list); this._render(); }).catch(() => {});
+      }
+      this._restoredText = content;
       this._render();
       return;
     }
+    // Nach angenommenem Versand darf ein fehlgeschlagenes GET nicht als
+    // Sendefehler erscheinen. Das Antwort-Tracking läuft trotzdem weiter.
+    try { await this._openConversation(result.conversationId); }
+    catch (_) { this._error = "Nachricht gesendet. Der Verlauf wird erneut geladen, sobald die Verbindung verfügbar ist."; }
     // Refresh the conversation list (title / ordering may have changed) —
     // entkoppelt vom Turn: Schlägt er fehl, ist die Nachricht trotzdem raus,
     // und das Antwort-Tracking (SSE/Polling) darf nicht abgebrochen werden.
     this._api("GET", "conversations")
       .then((l) => { this._applyConversations(l); this._render(); })
       .catch(() => {});
-    if (this._sseOk) {
-      // The answer arrives via assistant.delta/message/state events —
-      // no polling, no timeout needed. _busy clears on state=done/error.
-      this._render();
-    } else {
+    if (this._busy) {
+      // Auch bei SSE: Historie als Watchdog gegen verpasste Terminal-Events
+      // (z. B. eine sehr schnelle Antwort vor der POST-Bestätigung).
       this._startPolling(result.conversationId, result.userMessageId);
     }
+    this._render();
   }
 
   /** Composer-Textarea passend zum Inhalt wachsen lassen (max. 132 px). */
@@ -650,17 +776,23 @@ class AllroggenChatPanel extends HTMLElement {
   _startPolling(conversationId, afterMessageId) {
     this._stopPolling();
     const started = Date.now();
+    let fetching = false;
     this._pollTimer = setInterval(async () => {
+      if (fetching) return;
       if (Date.now() - started > POLL_TIMEOUT_MS) {
         this._stopPolling();
         this._busy = false;
+        this._busyConversationId = null;
+        this._busyUserMessageId = null;
         this._cancelling = false;
         this._error = "Die Antwort dauert länger als erwartet — bitte später erneut prüfen.";
         this._render();
         return;
       }
       try {
+        fetching = true;
         const conv = await this._api("GET", `conversations/${conversationId}`);
+        if (!this._busy || this._busyConversationId !== conversationId || this._busyUserMessageId !== afterMessageId) return;
         // Rollen case-insensitive prüfen: SSE liefert "tool", die Historie
         // "Tool" — das Terminal-Ereignis darf davon nicht abhängen.
         const done = conv.messages.some(
@@ -674,6 +806,7 @@ class AllroggenChatPanel extends HTMLElement {
           this._busyConversationId = null;
           this._busyUserMessageId = null;
           this._cancelling = false;
+          this._clearDraft();
           // Nur in die Ansicht übernehmen, wenn die Unterhaltung noch
           // geöffnet ist — sonst wird der Turn still abgeräumt.
           if (this._conversation && this._conversation.id === conversationId) {
@@ -689,7 +822,8 @@ class AllroggenChatPanel extends HTMLElement {
             .catch(() => {});
           this._render();
         }
-      } catch (_) { /* keep polling on transient errors */ }
+      } catch (_) { /* Bei temporären Fehlern weiter abgleichen. */ }
+      finally { fetching = false; }
     }, POLL_INTERVAL_MS);
   }
 
@@ -1415,21 +1549,22 @@ class AllroggenChatPanel extends HTMLElement {
 
   _sidebarHtml() {
     const cards = this._conversations
+      .filter((c) => !this._search || String(c.title).toLocaleLowerCase("de").includes(this._search.toLocaleLowerCase("de")))
       .map((c) => {
         const active = this._conversation && this._conversation.id === c.id;
         return `
-          <div class="conv-card ${active ? "active" : ""}" data-conv-id="${c.id}">
-            <div class="conv-title">${this._esc(c.title)}</div>
+          <button type="button" class="conv-card ${active ? "active" : ""}" data-conv-id="${c.id}" ${active ? 'aria-current="true"' : ""}>
+            <span class="conv-title">${this._esc(c.title)}</span>
             ${this._convDateHtml(c)}
-            ${active ? `<button type="button" class="conv-del" id="del" title="Unterhaltung löschen">✕</button>` : ""}
-          </div>`;
+          </button>`;
       })
       .join("");
     return `
-      <aside class="sidebar">
-        <button type="button" class="new-btn" id="new">＋ Neue Unterhaltung</button>
+      <aside class="sidebar" aria-label="Unterhaltungen" ${this._narrow && !this._drawerOpen ? "inert" : ""}>
+        <button type="button" class="new-btn" id="new">+ Neue Unterhaltung</button>
+        <input type="search" id="conv-search" aria-label="Unterhaltungen durchsuchen" placeholder="Unterhaltungen suchen…" value="${this._esc(this._search)}" />
         <div class="conv-list" id="conv-list">
-          ${cards || `<div class="conv-empty">Noch keine Unterhaltungen.</div>`}
+          ${cards || `<div class="conv-empty">${this._search ? "Keine passende Unterhaltung." : "Noch keine Unterhaltungen."}</div>`}
         </div>
       </aside>
       <div class="backdrop" id="backdrop"></div>`;
@@ -1499,16 +1634,20 @@ class AllroggenChatPanel extends HTMLElement {
     if (code !== null) {
       out.push(`<pre><code>${code.replace(/\n$/, "").replace(/\n/g, "&#10;")}</code></pre>`);
     }
-    return out.join("\n").replace(/\n/g, "<br>");
+    return out.join("\n").replace(/\n/g, "<br>")
+      .replace(/(<\/(?:ul|ol|pre)>)(?:<br>)+/g, "$1")
+      .replace(/(?:<br>)+(<(?:ul|ol|pre)>)/g, "$1");
   }
 
   /** Kontingent-Ring im Header: Prozent des Inklusivbudgets; EUR-Details in der Zeile darunter. */
   _quotaHtml() {
     const q = this._config && this._config.quota;
-    if (!q || q.costLimit == null) return ""; // ohne Limit keine Kontingent-Anzeige
-    const pct = q.costLimit > 0
-      ? Math.min(100, Math.round((Number(q.usedCost || 0) / Number(q.costLimit)) * 100))
-      : 100;
+    const included = this._toNum(q?.includedMonthlyEur);
+    const left = this._toNum(q?.includedRemainingEur);
+    const limit = included != null ? included : this._toNum(q?.costLimit);
+    if (!q || !(limit > 0)) return "";
+    const used = included != null && left != null ? included - left : Number(q.usedCost || 0);
+    const pct = Math.max(0, Math.min(100, Math.round(used / limit * 100)));
     const cls = q.exceeded ? "quota-exceeded" : q.warning ? "quota-warning" : "";
     const reset = new Date(q.resetsAt).toLocaleDateString("de-DE");
     const cur = q.currency || "EUR";
@@ -1585,20 +1724,22 @@ class AllroggenChatPanel extends HTMLElement {
       const img = m.hasAttachment
         ? `<img class="attachment" data-attachment-id="${m.id}" alt="${this._esc(m.attachmentFileName || "Anhang")}" hidden />`
         : "";
-      return `<div class="msg user"><div class="bubble">${img}${this._md(m.content)}</div>${this._timeHtml(m)}</div>`;
+      return `<div class="msg user"><div class="bubble">${img}${this._md(m.content)}</div>${this._timeHtml(m)}${this._messageActionsHtml(m)}</div>`;
     }
     if (role === "tool") {
       return `<div class="msg tool">⚙️ ${this._esc(m.content).slice(0, 120)}</div>`;
     }
     if (role === "error") {
-      return `<div class="msg assistant"><div class="bubble error">⚠️ ${this._md(m.content)}</div>${this._timeHtml(m)}</div>`;
+      const friendly = this._friendlyError(m.content);
+      const details = friendly !== m.content ? `<details data-state-key="error-${m.id}"><summary>Technische Details</summary><pre>${this._esc(m.content)}</pre></details>` : "";
+      return `<div class="msg assistant"><div class="bubble error"><strong>Antwort nicht möglich</strong><p>${this._esc(friendly)}</p>${details}</div>${this._timeHtml(m)}${this._messageActionsHtml(m)}</div>`;
     }
-    return `<div class="msg assistant"><div class="bubble">${this._md(m.content)}</div>${this._timeHtml(m)}</div>`;
+    return `<div class="msg assistant"><div class="bubble">${this._md(m.content)}</div>${this._timeHtml(m)}${this._messageActionsHtml(m)}</div>`;
   }
 
   _messagesHtml() {
     if (this._conversation === null) {
-      return `<div class="empty"><div class="empty-icon">💬</div>Neue Unterhaltung — schreib einfach unten deine Frage.</div>`;
+      return `<div class="empty"><div class="empty-icon">💬</div><h2>Wie kann ich dir helfen?</h2><p>Fragen zu deinem Smart Home, Automationen oder einem Problem — wir schauen gemeinsam drauf.</p><div class="suggestions">${["Welche Automationen sind gerade aktiv?", "Hilf mir, eine Automation anzupassen.", "Ich habe ein Problem mit meinem Smart Home."].map((s) => `<button type="button" class="btn-secondary suggestion" data-prompt="${this._esc(s)}">${this._esc(s)}</button>`).join("")}</div></div>`;
     }
     if (this._conversation.messages.length === 0) {
       return `<div class="empty"><div class="empty-icon">⏳</div>Lade…</div>`;
@@ -1623,6 +1764,9 @@ class AllroggenChatPanel extends HTMLElement {
     // Preserve the composer's content and focus across the full re-render.
     const prevInput = this.shadowRoot.getElementById("msg");
     const prevValue = prevInput ? prevInput.value : "";
+    const activeId = this.shadowRoot.activeElement?.id;
+    const selection = prevInput ? [prevInput.selectionStart, prevInput.selectionEnd] : [0, 0];
+    const openDetails = [...this.shadowRoot.querySelectorAll("details[open][data-state-key]")].map((el) => el.dataset.stateKey);
     const hadFocus = prevInput !== null && this.shadowRoot.activeElement === prevInput;
     // Scroll-Position merken, wenn der Nutzer weiter oben liest.
     const prevMessages = this.shadowRoot.getElementById("messages");
@@ -1635,7 +1779,7 @@ class AllroggenChatPanel extends HTMLElement {
       : "Support";
     const noAgent = this._config && !this._config.enabled;
     const quotaExceeded = this._config && this._config.quota && this._config.quota.exceeded;
-    const inputDisabled = this._busy || noAgent || quotaExceeded;
+    const inputDisabled = this._busy || this._forking || !this._config || noAgent || quotaExceeded;
     // Zähler für Unterhaltungen mit ungelesener Aktivität (wie der
     // Reparaturen-Zähler — nur eben im Panel, HA-Seitenleiste bietet dafür
     // für Custom Panels keine Badge-API).
@@ -1688,7 +1832,7 @@ class AllroggenChatPanel extends HTMLElement {
         .conv-list::-webkit-scrollbar { width: 6px; }
         .conv-list::-webkit-scrollbar-thumb { background: var(--divider-color, #ccc); border-radius: 3px; }
         .conv-list::-webkit-scrollbar-track { background: transparent; }
-        .conv-card { position: relative; padding: 10px 12px; border-radius: 12px; border: 1px solid var(--divider-color, #e2e2e2); border-left: 3px solid transparent; background: var(--card-background-color, #fff); cursor: pointer; }
+        .conv-card { position: relative; text-align: left; width: 100%; padding: 10px 12px; border-radius: 12px; border: 1px solid var(--divider-color, #e2e2e2); border-left: 3px solid transparent; background: var(--card-background-color, #fff); cursor: pointer; }
         .conv-card:hover { background: var(--secondary-background-color, #f3f3f3); }
         .conv-card.active { border-left-color: var(--primary-color, #03a9f4); background: var(--secondary-background-color, #f3f3f3); }
         .conv-title { font-size: 13px; font-weight: 500; color: var(--primary-text-color, #222); display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
@@ -1719,7 +1863,7 @@ class AllroggenChatPanel extends HTMLElement {
         .bubble { max-width: 78%; padding: 10px 14px; border-radius: 16px; border-bottom-left-radius: 4px; background: var(--card-background-color, #fff); border: 1px solid var(--divider-color, #e2e2e2); box-shadow: 0 1px 2px rgba(0,0,0,0.07); color: var(--primary-text-color, #222); line-height: 1.45; word-wrap: break-word; }
         .msg.user .bubble { background: var(--primary-color, #03a9f4); background: linear-gradient(135deg, var(--primary-color, #03a9f4), color-mix(in srgb, var(--primary-color, #03a9f4) 78%, #000)); color: #fff; border: none; box-shadow: 0 1px 3px rgba(0,0,0,0.18); border-radius: 16px; border-bottom-right-radius: 4px; }
         .bubble.draft { opacity: 0.85; }
-        .bubble.error { background: #fdecea; color: #b71c1c; border-color: #f5c6c0; box-shadow: none; }
+        .bubble.error { background: var(--card-background-color, #fff); color: var(--primary-text-color, #222); border-color: var(--error-color, #db4437); border-left-width: 3px; box-shadow: none; }
         .bubble code { font-family: monospace; background: rgba(127,127,127,0.15); padding: 1px 4px; border-radius: 4px; }
         .bubble pre { background: rgba(127,127,127,0.15); padding: 8px 10px; border-radius: 8px; overflow-x: auto; white-space: pre-wrap; margin: 6px 0; }
         .bubble pre code { background: transparent; padding: 0; }
@@ -1735,7 +1879,7 @@ class AllroggenChatPanel extends HTMLElement {
         img.attachment { display: block; max-width: 250px; border-radius: 12px; margin-bottom: 6px; }
 
         /* Banner */
-        .error-banner { background: #fdecea; color: #b71c1c; padding: 10px 14px; border-radius: 12px; font-size: 13px; }
+        .error-banner { background: var(--card-background-color, #fff); color: var(--primary-text-color, #222); border-left: 3px solid var(--error-color, #db4437); padding: 10px 14px; border-radius: 12px; font-size: 13px; }
         .notice { background: var(--secondary-background-color, #fff8e1); color: var(--primary-text-color, #795548); padding: 10px 14px; border-radius: 12px; font-size: 13px; }
 
         /* KI-Guthaben / Nachkauf */
@@ -1794,38 +1938,74 @@ class AllroggenChatPanel extends HTMLElement {
           .header h1 { font-size: 16px; }
           .avatar { width: 36px; height: 36px; font-size: 16px; }
         }
+        /* Ruhige Lesespalte, Theme-Kontrast und Touch-/Tastaturbedienung. */
+        .main { max-width: 960px; margin-inline: auto; }
+        .messages { padding: 16px 4px; gap: 18px; }
+        .bubble { max-width: min(85%, 72ch); line-height: 1.6; }
+        .bubble p { margin: 8px 0; }
+        .bubble details { margin-top: 12px; font-size: 12px; }
+        summary { cursor: pointer; padding: 8px 0; }
+        .bubble pre { white-space: pre-wrap; overflow-wrap: anywhere; }
+        .msg.user .bubble { background: var(--secondary-background-color, #eef3f8); color: var(--primary-text-color, #222); border: 1px solid var(--divider-color, #ccc); border-right: 3px solid var(--primary-color, #03a9f4); }
+        .new-btn, .send-btn, .btn-primary { background: var(--primary-color, #03a9f4); color: var(--text-primary-color, #fff); }
+        .new-btn { background: var(--card-background-color, #fff); color: var(--primary-text-color, #222); border: 1px solid var(--divider-color, #ccc); min-height: 44px; }
+        .send-btn { background: var(--primary-text-color, #222); color: var(--card-background-color, #fff); }
+        .icon-btn, .send-btn { min-width: 44px; min-height: 44px; }
+        .connection, .composer-hint { color: var(--secondary-text-color, #666); font-size: 12px; }
+        .connection { margin-top: 4px; }
+        .composer-hint { text-align: center; }
+        .conversation-head { display: flex; align-items: center; min-height: 44px; gap: 8px; }
+        .conversation-head strong { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .conversation-actions, .suggestions { display: flex; flex-wrap: wrap; gap: 8px; }
+        .suggestions { justify-content: center; }
+        .suggestion { min-height: 44px; }
+        .message-actions { display: flex; flex-wrap: wrap; gap: 4px; }
+        .message-action { background: transparent; color: var(--secondary-text-color, #666); border-radius: 8px; min-height: 36px; padding: 6px 10px; font-size: 12px; }
+        .message-action:hover { background: var(--secondary-background-color, #eee); color: var(--primary-text-color, #222); }
+        .narrow .message-action { min-height: 44px; }
+        .empty { max-width: 520px; line-height: 1.6; }
+        .empty h2 { color: var(--primary-text-color, #222); font-size: 23px; }
+        .chat-details { border: 1px solid var(--divider-color, #ccc); border-radius: 12px; padding: 12px; display: flex; flex-wrap: wrap; align-items: center; gap: 12px; }
+        #conv-search { font: inherit; box-sizing: border-box; width: 100%; min-height: 44px; padding: 8px 10px; border-radius: 8px; border: 1px solid var(--divider-color, #ccc); background: var(--card-background-color, #fff); color: var(--primary-text-color, #222); }
+        .narrow .header { flex-wrap: wrap; gap: 6px; }
+        .narrow .header-text { flex-basis: calc(100% - 160px); }
+        .narrow .bubble { max-width: 92%; }
+        .narrow .sidebar { width: min(280px, calc(100% - 32px)); box-sizing: border-box; }
+        .narrow .composer-hint { display: none; }
+        @media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation: none !important; transition: none !important; scroll-behavior: auto !important; } }
       </style>
       <div class="${wrapClasses}">
         <div class="header">
           ${this._narrow || this._haNarrow
             ? `<ha-menu-button class="ha-menu" narrow></ha-menu-button>`
             : ""}
-          <button type="button" class="icon-btn badged" id="conv-toggle" title="Unterhaltungen ein-/ausblenden">${ICON_FORUM}${unseenCount > 0 ? `<span class="toggle-badge">${unseenCount > 9 ? "9+" : unseenCount}</span>` : ""}</button>
+          <button type="button" class="icon-btn badged" id="conv-toggle" aria-label="Unterhaltungen ein-/ausblenden" aria-expanded="${this._narrow ? this._drawerOpen : !this._sidebarCollapsed}" title="Unterhaltungen ein-/ausblenden">${ICON_FORUM}${unseenCount > 0 ? `<span class="toggle-badge">${unseenCount > 9 ? "9+" : unseenCount}</span>` : ""}</button>
           <div class="avatar"><img id="avatar-img" src="/allroggen_chat_static/logo.svg" alt="" /></div>
           <div class="header-text">
             <h1>${this._esc(agentName)}</h1>
+            <div class="connection" role="status">${!this._config ? "Verbindung wird aufgebaut…" : this._sseOk ? "Live-Verbindung aktiv" : "Live-Verbindung wird wiederhergestellt · Verlauf wird abgeglichen"}</div>
           </div>
-          ${this._quotaHtml()}
-          ${hasTopup || quotaInfo ? `<button type="button" class="icon-btn badged" id="topup-toggle" title="KI-Guthaben & Nachkauf">€${topupAlert ? `<span class="toggle-badge">!</span>` : ""}</button>` : ""}
+          ${hasTopup || quotaInfo ? `<button type="button" class="btn-secondary credit-btn" id="topup-toggle" aria-expanded="${this._topupOpen}" title="KI-Guthaben & Nachkauf">${this._creditLabel()}${topupAlert ? " · !" : ""}</button>` : ""}
+          <button type="button" class="icon-btn" id="details-toggle" aria-label="Chat-Details" aria-expanded="${this._detailsOpen}" title="Chat-Details"><svg viewBox="0 0 24 24" width="22" height="22" fill="currentColor" aria-hidden="true"><path d="M11,7H13V9H11V7M11,11H13V17H11V11M12,2A10,10 0 0,0 2,12A10,10 0 0,0 12,22A10,10 0 0,0 22,12A10,10 0 0,0 12,2M12,4A8,8 0 0,1 20,12A8,8 0 0,1 12,20A8,8 0 0,1 4,12A8,8 0 0,1 12,4Z"/></svg></button>
         </div>
-        ${this._modelHtml()}
-        ${quotaInfo}
-        ${this._error ? `<div class="error-banner">${this._esc(this._error)}</div>` : ""}
+        ${this._detailsOpen ? `<section class="chat-details" aria-label="Chat-Details">${this._modelHtml()}${quotaInfo}${this._quotaHtml()}${this._usageHtml()}</section>` : ""}
+        ${this._error ? `<div class="error-banner" role="alert">${this._esc(this._error)} <button type="button" class="btn-secondary" id="refresh-history">Verlauf prüfen</button> <button type="button" class="icon-btn" id="dismiss-error" aria-label="Hinweis schließen">×</button></div>` : ""}
         ${noAgent ? `<div class="notice">Der Chat ist für deinen Zugang noch nicht eingerichtet. Bitte kontaktiere deinen Dienstleister.</div>` : ""}
         ${this._quotaNoticeHtml()}
         ${this._topupHtml()}
         <div class="body">
           ${this._sidebarHtml()}
           <div class="main">
-            ${this._usageHtml()}
+            <div class="conversation-head"><strong>${this._esc(this._conversation?.title || "Neue Unterhaltung")}</strong>${this._conversation ? `<button type="button" class="icon-btn" id="conversation-menu" aria-label="Unterhaltungsaktionen" aria-expanded="${this._menuOpen}">⋯</button>` : ""}</div>
+            ${this._menuOpen && this._conversation ? `<div class="conversation-actions"><button type="button" class="btn-secondary" id="rename">Umbenennen</button><button type="button" class="btn-secondary" id="reuse">Letzte Frage bearbeiten</button><button type="button" class="btn-secondary" id="del">Unterhaltung löschen</button></div>` : ""}
             <div class="messages-wrap">
-              <div class="messages" id="messages">
+              <div class="messages" id="messages" role="region" aria-label="Chatverlauf" tabindex="0">
                 ${this._messagesHtml()}
                 ${this._draft ? `<div class="msg assistant" id="draft-bubble"><div class="bubble draft">${this._md(this._draft)}</div></div>` : ""}
                 ${this._busy && !this._draft && this._conversation && this._conversation.id === this._busyConversationId ? `
                   <div class="msg assistant busy">
                     <div class="bubble typing" title="${this._cancelling ? "Wird abgebrochen…" : "Der Agent arbeitet…"}"><span class="dot"></span><span class="dot"></span><span class="dot"></span></div>
-                    ${this._cancelling ? `<div class="meta">Wird abgebrochen…</div>` : ""}
+                    <div class="meta" role="status">${this._cancelling ? "Wird abgebrochen…" : "Antwort wird erstellt…"}</div>
                   </div>` : ""}
               </div>
               ${this._unseenBelow ? `<button type="button" class="new-msgs" id="new-msgs">↓ Neue Nachrichten</button>` : ""}
@@ -1841,17 +2021,24 @@ class AllroggenChatPanel extends HTMLElement {
               <input type="file" id="imgfile" accept="image/*" hidden />
               <button type="button" class="icon-btn" id="attach" title="Bild anhängen" ${inputDisabled ? "disabled" : ""}>${ICON_PAPERCLIP}</button>
               ${this._speechSupported() ? `<button type="button" class="icon-btn ${this._recording ? "recording" : ""}" id="mic" title="Spracheingabe" ${inputDisabled ? "disabled" : ""}>${ICON_MIC}</button>` : ""}
-              <textarea id="msg" rows="1" placeholder="Nachricht schreiben…" ${inputDisabled ? "disabled" : ""}></textarea>
+              <textarea id="msg" rows="1" aria-label="Nachricht" aria-describedby="composer-hint" placeholder="Nachricht schreiben…" ${inputDisabled ? "disabled" : ""}></textarea>
               ${this._busy && this._busyConversationId != null
                 ? `<button type="button" class="cancel-btn" id="cancel" ${this._cancelling ? "disabled" : ""}>Abbrechen</button>`
                 : `<button type="button" class="send-btn" id="send" title="Senden" ${inputDisabled ? "disabled" : ""}>${ICON_SEND}</button>`}
             </div>
+            <div class="composer-hint" id="composer-hint">Enter sendet · Umschalt + Enter für eine neue Zeile</div>
           </div>
         </div>
       </div>
     `;
 
     const send = this.shadowRoot.getElementById("send");
+    this.shadowRoot.querySelector(".wrap").addEventListener("keydown", (event) => {
+      if (event.key === "Escape" && (this._drawerOpen || this._menuOpen)) {
+        this._drawerOpen = false; this._menuOpen = false; this._render();
+        this.shadowRoot.getElementById("conv-toggle").focus();
+      }
+    });
     if (send) send.addEventListener("click", () => this._send());
     const cancel = this.shadowRoot.getElementById("cancel");
     if (cancel) cancel.addEventListener("click", () => this._cancel());
@@ -1888,12 +2075,36 @@ class AllroggenChatPanel extends HTMLElement {
     const topupClose2 = this.shadowRoot.getElementById("topup-close2");
     if (topupClose2) topupClose2.addEventListener("click", () => this._topupClose());
     const msgInput = this.shadowRoot.getElementById("msg");
+    for (const button of this.shadowRoot.querySelectorAll("[data-copy]")) button.addEventListener("click", () => this._copyMessage(Number(button.dataset.copy), button));
+    for (const button of this.shadowRoot.querySelectorAll("[data-fork]")) button.addEventListener("click", () => this._forkConversation(Number(button.dataset.fork)));
+    for (const button of this.shadowRoot.querySelectorAll("button[title]")) if (!button.hasAttribute("aria-label")) button.setAttribute("aria-label", button.title);
     if (prevValue) msgInput.value = prevValue;
+    if (this._restoredText !== null) { msgInput.value = this._restoredText; this._restoredText = null; }
     this._autoGrow(msgInput);
     if (hadFocus && !msgInput.disabled) {
       msgInput.focus();
-      msgInput.selectionStart = msgInput.selectionEnd = msgInput.value.length;
+      msgInput.setSelectionRange(...selection);
     }
+    for (const el of this.shadowRoot.querySelectorAll("details[data-state-key]")) el.open = openDetails.includes(el.dataset.stateKey);
+    if (!hadFocus && activeId) this.shadowRoot.getElementById(activeId)?.focus({ preventScroll: true });
+    this.shadowRoot.getElementById("details-toggle").addEventListener("click", () => { this._detailsOpen = !this._detailsOpen; this._render(); });
+    this.shadowRoot.getElementById("conversation-menu")?.addEventListener("click", () => { this._menuOpen = !this._menuOpen; this._render(); });
+    this.shadowRoot.getElementById("rename")?.addEventListener("click", () => this._renameConversation());
+    this.shadowRoot.getElementById("reuse")?.addEventListener("click", () => this._reuseQuestion());
+    this.shadowRoot.getElementById("dismiss-error")?.addEventListener("click", () => { this._error = null; this._render(); });
+    this.shadowRoot.getElementById("refresh-history")?.addEventListener("click", () => this._refreshHistory());
+    const search = this.shadowRoot.getElementById("conv-search");
+    search.addEventListener("input", () => {
+      this._search = search.value;
+      const start = search.selectionStart;
+      this._render();
+      const next = this.shadowRoot.getElementById("conv-search");
+      next.focus(); next.setSelectionRange(start, start);
+    });
+    for (const suggestion of this.shadowRoot.querySelectorAll(".suggestion")) suggestion.addEventListener("click", () => {
+      if (msgInput.disabled) return;
+      msgInput.value = suggestion.dataset.prompt; msgInput.focus(); this._autoGrow(msgInput);
+    });
     msgInput.addEventListener("input", () => this._autoGrow(msgInput));
     msgInput.addEventListener("keydown", (e) => {
       // Enter sendet, Umschalt+Enter macht einen Zeilenumbruch; während
@@ -1937,26 +2148,18 @@ class AllroggenChatPanel extends HTMLElement {
       this._lastScrollTop = messagesEl.scrollTop;
     });
     this._loadAttachments();
-    // Baseline für die Nutzer-Scroll-Erkennung: Das frisch gerenderte Element
-    // startet bei scrollTop 0 — ohne Reset würde der anschließende
-    // (ggf. animierte) Scroll nach unten fälschlich als „Nutzer scrollt hoch"
-    // gewertet und _nearBottom gelöscht.
     this._lastScrollTop = messagesEl.scrollTop;
     if (this._nearBottom) {
-      // Nach einem Voll-Re-Render sofort (ohne Animation) ans Ende springen.
       this._scrollDown(false);
     } else if (prevScrollTop > 0) {
-      // Leseposition über den Re-Render hinweg wiederherstellen.
-      const top = prevScrollTop;
       requestAnimationFrame(() => {
         if (messagesEl.isConnected) {
-          messagesEl.scrollTop = top;
-          this._lastScrollTop = top;
+          messagesEl.scrollTop = prevScrollTop;
+          this._lastScrollTop = prevScrollTop;
         }
       });
     }
   }
-
 }
 
 customElements.define("allroggen-chat-panel", AllroggenChatPanel);

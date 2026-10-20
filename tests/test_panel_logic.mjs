@@ -316,4 +316,4 @@ for (const reason of ["invoice-overdue", "credit-product-not-configured"]) {
 }
 
 console.log(`\n${passed} passed, ${failed} failed`);
-process.exit(failed === 0 ? 0 : 1);
+process.exitCode = failed === 0 ? 0 : 1;
