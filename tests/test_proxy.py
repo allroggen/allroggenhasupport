@@ -67,6 +67,65 @@ async def test_proxy_post_messages_forwards_body(
         assert call.kwargs["headers"]["Content-Type"] == "application/json"
 
 
+async def test_proxy_post_topup_forwards_request_id(
+    hass, hass_client, mock_config_entry, monkeypatch
+) -> None:
+    """A top-up order is forwarded with the customer token and the top-up
+    timeout branch selected.
+
+    The three proxy timeouts are monkeypatched to distinct values so the
+    assertion proves the /topup branch picks TIMEOUT_TOPUP specifically —
+    not an accidental match because TIMEOUT_TOPUP == TIMEOUT_SEND.
+    """
+    import custom_components.allroggen_chat.proxy as proxy_module
+
+    monkeypatch.setattr(proxy_module, "TIMEOUT_TOPUP", 61)
+    monkeypatch.setattr(proxy_module, "TIMEOUT_SEND", 62)
+    monkeypatch.setattr(proxy_module, "TIMEOUT_DEFAULT", 63)
+
+    await _setup(hass, mock_config_entry)
+    topup_url = URL(f"{BACKEND_URL}/api/customer-chat/topup")
+    request_id = "0e0d7bc6-6f5e-4bd8-a27a-2bf4ba49a26e"
+    with _mock_backend() as m:
+        m.post(
+            str(topup_url),
+            status=200,
+            payload={"status": "granted", "amountEur": "10.00"},
+        )
+        client = await hass_client()
+        resp = await client.post(f"{PROXY_URL_BASE}/topup", json={"requestId": request_id})
+
+        assert resp.status == 200
+        assert await resp.json() == {"status": "granted", "amountEur": "10.00"}
+        call = m.requests[("POST", topup_url)][0]
+        assert call.kwargs["headers"]["X-Customer-Token"] == API_TOKEN
+        assert request_id.encode() in call.kwargs["data"]
+        # 61 = TIMEOUT_TOPUP (gemockt); 62 wäre SEND, 63 DEFAULT.
+        assert call.kwargs["timeout"].total == 61
+
+
+async def test_proxy_post_topup_blocked_409_passthrough(
+    hass, hass_client, mock_config_entry
+) -> None:
+    """A 409 topup_blocked (with reasons) reaches the panel unchanged — the
+    proxy must not turn a server-side block into a success."""
+    await _setup(hass, mock_config_entry)
+    topup_url = URL(f"{BACKEND_URL}/api/customer-chat/topup")
+    blocked = {
+        "error": "topup_blocked",
+        "reasons": ["credit-awaiting-validated-invoice", "invoice-overdue"],
+    }
+    with _mock_backend() as m:
+        m.post(str(topup_url), status=409, payload=blocked)
+        client = await hass_client()
+        resp = await client.post(
+            f"{PROXY_URL_BASE}/topup", json={"requestId": "x" * 36}
+        )
+
+        assert resp.status == 409
+        assert await resp.json() == blocked
+
+
 async def test_proxy_stream_relays_sse(hass, hass_client, mock_config_entry) -> None:
     """The SSE endpoint is streamed through, not buffered like a JSON call."""
     await _setup(hass, mock_config_entry)

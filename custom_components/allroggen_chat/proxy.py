@@ -24,6 +24,7 @@ from .const import (
     PROXY_URL_BASE,
     TIMEOUT_DEFAULT,
     TIMEOUT_SEND,
+    TIMEOUT_TOPUP,
     TIMEOUT_STREAM_CONNECT,
     TIMEOUT_STREAM_READ,
 )
@@ -77,7 +78,14 @@ class AllroggenChatProxyView(HomeAssistantView):
             target += f"?{request.query_string}"
 
         body = await request.read() if request.can_read_body else None
-        timeout = TIMEOUT_SEND if tail.startswith("messages") else TIMEOUT_DEFAULT
+        if tail.startswith("messages"):
+            timeout = TIMEOUT_SEND
+        elif tail.startswith("topup"):
+            # The top-up endpoint waits for the ERP (invoice) round-trip
+            # server-side before granting the credit.
+            timeout = TIMEOUT_TOPUP
+        else:
+            timeout = TIMEOUT_DEFAULT
 
         session = async_get_clientsession(self._hass)
         try:

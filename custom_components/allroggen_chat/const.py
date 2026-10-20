@@ -19,6 +19,9 @@ PANEL_ICON = "mdi:robot-happy-outline"
 # Backend timeouts (seconds)
 TIMEOUT_DEFAULT = 15
 TIMEOUT_SEND = 60
+# Top-up: the backend books the credit through the ERP (invoice) before it
+# answers — allow a longer round-trip than a plain config call.
+TIMEOUT_TOPUP = 60
 # SSE stream: no total timeout (long-lived); the backend heartbeats every 15 s,
 # so a read timeout well above that keeps dead connections detectable.
 TIMEOUT_STREAM_CONNECT = 15

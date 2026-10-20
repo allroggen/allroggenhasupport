@@ -20,6 +20,10 @@ const SSE_BACKOFF_START_MS = 5000;
 const SSE_BACKOFF_MAX_MS = 60000;
 const DRAFT_FLUSH_MS = 80; // DOM-Update-Takt beim Delta-Streaming
 const CONV_REFRESH_DELAY_MS = 1500; // Debounce für Listen-Refreshs (Badges)
+// requestId eines Nachkauf-Auftrags: echter v4-GUID (auch beim Laden aus
+// dem localStorage geprüft — Länge allein fängt keine kaputten Einträge ab).
+const TOPUP_REQUEST_ID_RE =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 // Material Design Icons (24x24), eingefärbt über currentColor.
 const ICON_PAPERCLIP =
@@ -84,6 +88,34 @@ class AllroggenChatPanel extends HTMLElement {
       );
     } catch (_) {
       this._lastSeen = new Map(); // convId → updatedAt beim letzten Ansehen
+    }
+    // ---- KI-Guthaben / Nachkauf -------------------------------------------
+    // Ein Nachkauf-Auftrag läuft IMMER unter einer requestId (GUID). Nach
+    // unklarem Netz-Ergebnis wird dieselbe ID wiederholt (Idempotenz —
+    // nichts wird doppelt gekauft). Gelöscht wird sie bei EINDEUTIGEM
+    // Abschluss: Erfolg (neue ID für den nächsten Kauf) ODER definitiver
+    // Ablehnung durch den Server (409 topup_blocked / 400) — ein abgelehnter
+    // Schlüssel wird nie wiederverwendet und vor allem nicht als "offener
+    // Auftrag mit unklarem Ergebnis" angezeigt.
+    this._topupOpen = false; // Guthaben-Karte aufgeklappt
+    this._topupStage = null; // null | "confirm" | "sending" | "unclear" | "done"
+    this._topupRequestInFlight = false; // Doppelklick-Schutz
+    this._topupBlockedReasons = null; // reasons aus 409 topup_blocked
+    this._topupError = null; // sonstige Fehlermeldung
+    this._topupDoneStatus = null; // "granted" | "idempotent"
+    this._topupDoneAmount = null; // EUR-String der Buchung
+    try {
+      const stored = localStorage.getItem("allroggenChat.topupRequestId");
+      if (stored && TOPUP_REQUEST_ID_RE.test(stored)) {
+        this._topupRequestId = stored;
+      } else {
+        // Defekter/veralteter Eintrag: verwerfen, sonst täuschte er für
+        // immer einen nie auflösbaren "offenen Auftrag" vor.
+        this._topupRequestId = null;
+        if (stored) localStorage.removeItem("allroggenChat.topupRequestId");
+      }
+    } catch (_) {
+      this._topupRequestId = null;
     }
   }
 
@@ -581,7 +613,12 @@ class AllroggenChatPanel extends HTMLElement {
       if (err && err.status === 429 && err.body && err.body.quota) {
         const q = err.body.quota;
         const reset = new Date(q.resetsAt).toLocaleDateString("de-DE");
-        this._error = `Dein monatliches Chat-Kontingent ist aufgebraucht. Es wird am ${reset} zurückgesetzt.`;
+        const t = this._config && this._config.topup;
+        const topupHint =
+          t && t.allowed && this._toNum(t.amountEur) > 0
+            ? ` Du kannst ${this._eur(t.amountEur, q.currency) || "Guthaben"} auf Rechnung nachbuchen (€-Button oben).`
+            : "";
+        this._error = `Dein KI-Kontingent ist aufgebraucht (Reset am ${reset}). Tickets und Support laufen normal weiter.${topupHint}`;
         if (this._config) this._config.quota = q;
       } else {
         this._error = this._describeError(err);
@@ -742,7 +779,373 @@ class AllroggenChatPanel extends HTMLElement {
     }
   }
 
-  // ---- Bild-Upload -------------------------------------------------------------
+  // ---- KI-Guthaben / Nachkauf (topup) ----------------------------------------
+
+  /** Deutsches EUR-Format für decimal-string ODER json-number (robust). */
+  _toNum(v) {
+    if (v == null) return null;
+    const n = typeof v === "number" ? v : parseFloat(v);
+    return isFinite(n) ? n : null;
+  }
+
+  _eur(v, currency) {
+    const n = this._toNum(v);
+    if (n == null) return null;
+    const cur = currency || "EUR";
+    const sym = cur === "EUR" ? "€" : cur;
+    return `${new Intl.NumberFormat("de-DE", {
+      minimumFractionDigits: 2,
+      maximumFractionDigits: 2,
+    }).format(n)} ${sym}`;
+  }
+
+  _uuid() {
+    if (window.crypto && typeof crypto.randomUUID === "function") {
+      return crypto.randomUUID();
+    }
+    // RFC-4122-v4-Fallback für ältere WebViews.
+    return "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, (c) => {
+      const r = (Math.random() * 16) | 0;
+      const v = c === "x" ? r : (r & 0x3) | 0x8;
+      return v.toString(16);
+    });
+  }
+
+  /**
+   * requestId des offenen Nachkauf-Auftrags — wird einmal erzeugt und
+   * persistiert. Wiederholungen nach UNKLAREM Netz-Ergebnis (auch nach
+   * Seiten-Reload) nutzen dieselbe ID, damit das Backend idempotent
+   * antworten kann statt doppelt zu buchen; bei eindeutigem Erfolg oder
+   * definitiver Ablehnung wird sie freigegeben (_clearTopupRequestId).
+   *
+   * Die ID ist ein reiner Idempotenz-Schlüssel und NICHT vom Kunden-Token
+   * abgeleitet. Sie lebt pro Browser-Profil/Origin: Wechselt an derselben
+   * HA-Instanz der Kunde (neues Token), bleibt im schlimmsten Fall ein
+   * verwaister Schlüssel in localStorage übrig — serverseitig wird eine
+   * requestId immer im Kontext des authentifizierten Kunden ausgewertet,
+   * ein Auftrag im Namen eines anderen Kunden ist damit ausgeschlossen.
+   */
+  _ensureTopupRequestId() {
+    if (this._topupRequestId && TOPUP_REQUEST_ID_RE.test(this._topupRequestId)) {
+      return this._topupRequestId;
+    }
+    this._topupRequestId = this._uuid();
+    try {
+      localStorage.setItem("allroggenChat.topupRequestId", this._topupRequestId);
+    } catch (_) { /* localStorage nicht verfügbar */ }
+    return this._topupRequestId;
+  }
+
+  _clearTopupRequestId() {
+    this._topupRequestId = null;
+    try {
+      localStorage.removeItem("allroggenChat.topupRequestId");
+    } catch (_) { /* localStorage nicht verfügbar */ }
+  }
+
+  /** Verbindliche Bestätigung öffnen (kein Netz-Call, nur UI-Schritt). */
+  _topupStartConfirm() {
+    const t = this._config && this._config.topup;
+    // Fail-closed: ohne serverseitig freigegebenen Betrag kein Angebot.
+    if (!t || !t.allowed || !(this._toNum(t.amountEur) > 0)) return;
+    this._topupStage = "confirm";
+    this._topupError = null;
+    this._render();
+  }
+
+  _topupCancel() {
+    if (this._topupRequestInFlight) return; // während des Flugs nicht abbrechbar
+    this._topupStage = null;
+    this._topupError = null;
+    this._render();
+  }
+
+  _topupClose() {
+    this._topupOpen = false;
+    this._topupStage = null;
+    this._topupError = null;
+    this._topupBlockedReasons = null;
+    this._render();
+  }
+
+  /**
+   * Nachkauf senden — robust gegen unklare Netz-Ergebnisse:
+   * - 200 granted/idempotent → Erfolg, requestId freigeben, Config neu laden.
+   * - 409 topup_blocked / 400 / 401 → DEFINITIVE Ablehnung: nichts wurde
+   *   gebucht, requestId verwerfen (kein "offener Auftrag", keine Wiederver-
+   *   wendung des abgelehnten Schlüssels) und Config neu laden (409).
+   * - sonst (Netz/5xx)  → "unclear": Offener Auftrag bleibt mit derselben
+   *   requestId bestehen; "Erneut senden" ist sicher (idempotent).
+   * Ein Kauf wird NUR durch den expliziten Klick hier ausgelöst — nie still.
+   */
+  _sendTopup(isRetry = false) {
+    const t = this._config && this._config.topup;
+    if (!isRetry) {
+      // Fail-closed: Ein NEUER Kauf braucht die serverseitige Freigabe samt
+      // Betrag. Ein Retry eines offenen Auftrags prüft der Server selbst —
+      // er antwortet idempotent (200) oder mit 409 + Gründen.
+      if (!t || !t.allowed || !(this._toNum(t.amountEur) > 0)) return;
+    } else if (!this._topupRequestId) {
+      return; // kein offener Auftrag — nichts zu wiederholen
+    }
+    if (this._topupRequestInFlight) return; // Doppelklick-Schutz
+    const requestId = this._ensureTopupRequestId();
+    this._topupRequestInFlight = true;
+    this._topupStage = "sending";
+    this._topupError = null;
+    this._render();
+    this._api("POST", "topup", { requestId })
+      .then((res) => {
+        this._topupRequestInFlight = false;
+        this._topupDoneStatus = res && res.status === "idempotent" ? "idempotent" : "granted";
+        // Response-Betrag ist führend; t kann beim Retry null sein (Config
+        // hat sich geändert) — dann bleibt null und "done" zeigt "–".
+        this._topupDoneAmount =
+          (res && res.amountEur != null && this._toNum(res.amountEur) != null && res.amountEur)
+          || (t && t.amountEur)
+          || null;
+        // Eindeutiger Erfolg → Auftrag abschließen; der nächste Kauf bekommt
+        // beim nächsten Bestätigen automatisch eine neue ID.
+        this._clearTopupRequestId();
+        this._topupStage = "done";
+        this._render();
+        // Config neu laden: Guthaben/topup-Zustand (allowed/pending) folgt
+        // der Buchung. Schlägt das nach, holt es der nächste Turn nach.
+        this._api("GET", "config")
+          .then((c) => { this._config = c; this._render(); })
+          .catch(() => {});
+      })
+      .catch((err) => {
+        this._topupRequestInFlight = false;
+        if (err && err.status === 409 && err.body && err.body.error === "topup_blocked") {
+          this._topupStage = null;
+          this._topupBlockedReasons = Array.isArray(err.body.reasons) ? err.body.reasons : [];
+          // Definitive Blockade: nichts gebucht → offenen Auftrag auflösen,
+          // der abgelehnte Schlüssel wird nicht wiederverwendet.
+          this._clearTopupRequestId();
+          this._api("GET", "config")
+            .then((c) => {
+              this._config = c;
+              // Die frische Config liefert die Gründe autoritativ über
+              // topup.reasons — die lokale 409-Kopie wird frei, damit sie
+              // nicht veraltet stehen bleibt.
+              this._topupBlockedReasons = null;
+              this._render();
+            })
+            .catch(() => {});
+        } else if (err && (err.status === 400 || err.status === 401)) {
+          // Definitive Ablehnung (ungültiger Auftrag / Auth): nichts gebucht
+          // → requestId ebenfalls verwerfen.
+          this._topupStage = null;
+          this._clearTopupRequestId();
+          this._topupError =
+            err.status === 401
+              ? this._describeError(err)
+              : "Der Nachkauf-Auftrag wurde abgelehnt. Bitte später erneut versuchen.";
+        } else {
+          // Netz unklar (Timeout, Verbindungsabbruch, 5xx/502): Der Auftrag
+          // KÖNNTE bereits gebucht sein. Kein Fehlerergebnis als Erfolg
+          // ausgeben — status "unclear" bietet denselben Auftrag zum
+          // Wiederholen an.
+          this._topupStage = "unclear";
+        }
+        this._render();
+      });
+  }
+
+  /** Server-Reason-Codes verständlich ausformulieren (unbekannte roh — Escaping passiert im Aufrufer). */
+  _topupReasonText(code) {
+    const known = {
+      "credit-awaiting-validated-invoice":
+        "Der vorherige Nachkauf wartet noch auf eine validierte Rechnung. Der nächste Nachkauf wird möglich, sobald diese validiert ist.",
+      "invoice-overdue":
+        "Es gibt eine überfällige Rechnung. Bitte zuerst begleichen — danach ist der Nachkauf wieder möglich.",
+      "topup-not-configured":
+        "Für deinen Vertrag ist kein Nachkauf-Betrag hinterlegt. Bitte kontaktiere deinen Dienstleister.",
+      "credit-product-not-configured":
+        "KI-Guthabenartikel noch nicht eingerichtet. Bitte Support kontaktieren.",
+      "contract-inactive":
+        "Dein Vertrag ist nicht aktiv — der Nachkauf ist daher gesperrt.",
+    };
+    if (known[code]) return known[code];
+    return `Nachkauf aktuell nicht möglich (Grund: ${code}).`;
+  }
+
+  _topupReasonsHtml(reasons) {
+    if (!Array.isArray(reasons) || reasons.length === 0) return "";
+    const items = reasons
+      .map((r) => `<li>${this._esc(this._topupReasonText(String(r)))}</li>`)
+      .join("");
+    return `<ul class="topup-reasons">${items}</ul>`;
+  }
+
+  /** Kompakte EUR-Zeile unter dem Header — nur wenn das Backend die neuen Felder liefert. */
+  _quotaInfoHtml() {
+    const q = this._config && this._config.quota;
+    if (!q) return "";
+    const cur = q.currency || "EUR";
+    const included = this._toNum(q.includedMonthlyEur);
+    const includedLeft = this._toNum(q.includedRemainingEur);
+    const credit = this._toNum(q.creditRemainingEur);
+    if (included == null && includedLeft == null && credit == null) return "";
+    const parts = [];
+    if (included != null || includedLeft != null) {
+      parts.push(
+        `KI-Budget diesen Monat: <strong>${this._esc(
+          this._eur(includedLeft != null ? includedLeft : 0, cur) || "–"
+        )}</strong> von ${this._esc(this._eur(included != null ? included : 0, cur) || "–")} inklusive übrig`
+      );
+    }
+    if (credit != null) {
+      parts.push(`Gekauftes Guthaben: <strong>${this._esc(this._eur(credit, cur) || "–")}</strong> (bleibt erhalten)`);
+    }
+    const reset = q.resetsAt
+      ? ` · Inklusivbudget resetzt am ${this._esc(new Date(q.resetsAt).toLocaleDateString("de-DE"))}`
+      : "";
+    return `<div class="quota-info">💰 ${parts.join(" · ")}${reset}</div>`;
+  }
+
+  /**
+   * Notice bei erschöpftem Kontingent. Neue Backends (EUR-Felder vorhanden)
+   * sagen explizit: nur die KI pausiert, Tickets/Support laufen weiter.
+   * Ältere Backends ohne die neuen Felder behalten den alten Text.
+   */
+  _quotaNoticeHtml() {
+    const c = this._config;
+    const q = c && c.quota;
+    if (!q || !q.exceeded) return "";
+    const hasNew =
+      this._toNum(q.includedMonthlyEur) != null ||
+      this._toNum(q.includedRemainingEur) != null ||
+      this._toNum(q.creditRemainingEur) != null;
+    if (!hasNew) {
+      return `<div class="notice">Monatliches Chat-Kontingent erschöpft — der Chat ist bis zum Reset pausiert.</div>`;
+    }
+    const reset = q.resetsAt ? new Date(q.resetsAt).toLocaleDateString("de-DE") : null;
+    const resetTxt = reset ? ` bis zum Reset am ${this._esc(reset)}` : "";
+    const t = c.topup;
+    const topupTxt =
+      t && t.allowed && this._toNum(t.amountEur) > 0
+        ? ` Du kannst ${this._esc(this._eur(t.amountEur, q.currency) || "Guthaben")} auf Rechnung nachbuchen (€-Button oben).`
+        : "";
+    return `<div class="notice">Inklusives KI-Budget und gekauftes Guthaben sind aufgebraucht — die KI-Antwort pausiert${resetTxt}. Tickets und Support laufen normal weiter.${topupTxt}</div>`;
+  }
+
+  /** Guthaben-/Nachkauf-Karte (nur sichtbar bei aufgeklapptem Zustand). */
+  _topupHtml() {
+    const c = this._config || {};
+    const q = c.quota || {};
+    const t = c.topup;
+    if (!this._topupOpen) return "";
+    // Ohne topup-Objekt (älteres Backend): Karte erklärt nur das Budget,
+    // zeigt aber bewusst KEIN Nachkauf-Angebot (kein erfundenes Guthaben).
+    const cur = q.currency || "EUR";
+    const included = this._eur(q.includedMonthlyEur, cur);
+    let inner = "";
+
+    const expl = included
+      ? `<p>Dein Vertrag enthält jeden Monat <strong>${this._esc(included)}</strong> KI-Nutzung inklusive — unverbrauchter Rest verfällt zum Monatswechsel (kein Übertrag). Erst danach wird gekauftes Guthaben verbraucht; es bleibt über Monate erhalten. Ist beides aufgebraucht, pausiert nur die KI-Antwort — Tickets und Support laufen ganz normal weiter.</p>`
+      : `<p>Dein Vertrag enthält jeden Monat ein KI-Budget inklusive — unverbrauchter Rest verfällt zum Monatswechsel (kein Übertrag). Erst danach wird gekauftes Guthaben verbraucht; es bleibt über Monate erhalten. Ist beides aufgebraucht, pausiert nur die KI-Antwort — Tickets und Support laufen ganz normal weiter.</p>`;
+
+    const unresolved =
+      this._topupRequestId && this._topupStage !== "done" && !this._topupRequestInFlight;
+    // Bestätigungs-Ansicht nur mit weiterhin gültiger serverseitiger Freigabe
+    // (ein Config-Refresh kann allowed zwischendurch kippen → Übersicht).
+    const confirmValid = !!(t && t.allowed && this._toNum(t.amountEur) > 0);
+    const stage = this._topupStage === "confirm" && !confirmValid ? null : this._topupStage;
+
+    if (stage === "sending") {
+      inner = `
+        <div class="topup-status">⏳ Nachbuchung läuft — bitte warten, das Fenster nicht schließen …</div>`;
+    } else if (stage === "unclear") {
+      inner = `
+        <div class="topup-status warn">⚠ Das Ergebnis der Nachbuchung ist unklar (Verbindungsproblem). Sie könnte bereits gebucht sein.</div>
+        <p>Bitte <strong>erneut senden</strong>: derselbe Auftrag (gleiche Anfrage-ID <code>${this._esc(this._topupRequestId || "")}</code>) wird sicher fortgesetzt — es wird garantiert nichts doppelt gekauft.</p>
+        <div class="topup-actions">
+          <button type="button" class="btn-secondary" id="topup-close2">Später erneut versuchen</button>
+          <button type="button" class="btn-primary" id="topup-retry">Erneut senden (gleicher Auftrag)</button>
+        </div>`;
+    } else if (stage === "done") {
+      const amount = this._eur(this._topupDoneAmount, cur);
+      const msg = this._topupDoneStatus === "idempotent"
+        ? `Dieser Nachkauf war bereits gebucht — Guthaben über <strong>${this._esc(amount || "–")}</strong> ist aktiv. Nichts wurde doppelt gekauft.`
+        : `Guthaben über <strong>${this._esc(amount || "–")}</strong> wurde gebucht und ist sofort aktiviert.`;
+      inner = `
+        <div class="topup-status ok">✓ ${msg}</div>
+        <p>Der Betrag wird auf deiner nächsten Rechnung ausgewiesen. Ein weiterer Nachkauf ist erst möglich, wenn dieser auf einer validierten Rechnung erfasst ist.</p>
+        <div class="topup-actions">
+          <button type="button" class="btn-primary" id="topup-close">Schließen</button>
+        </div>`;
+    } else if (stage === "confirm") {
+      const amount = this._eur(t && t.amountEur, cur);
+      inner = `
+        <div class="topup-confirm-line">Kostenpflichtig: <strong>${this._esc(amount || "–")}</strong> auf Rechnung nachbuchen</div>
+        <ul class="topup-details">
+          <li>Sofort nutzbar, sobald die Buchhaltung (ERP) die Buchung annimmt — in der Regel sofort.</li>
+          <li>Wird erst nach dem Inklusivbudget verbraucht und verfällt nicht.</li>
+          <li>Wird auf deiner nächsten Rechnung ausgewiesen.</li>
+          <li>Ein weiterer Nachkauf ist erst möglich, wenn dieser auf einer validierten Rechnung erfasst ist.</li>
+        </ul>
+        <div class="topup-actions">
+          <button type="button" class="btn-secondary" id="topup-back">Zurück</button>
+          <button type="button" class="btn-danger" id="topup-confirm">Kostenpflichtig: ${this._esc(amount || "–")} auf Rechnung nachbuchen</button>
+        </div>`;
+    } else {
+      // Übersicht
+      const stateParts = [];
+      const credit = this._eur(q.creditRemainingEur, cur);
+      if (credit) stateParts.push(`Gekauftes Guthaben übrig: <strong>${this._esc(credit)}</strong>.`);
+      const pending = t && t.pending;
+      if (pending) {
+        stateParts.push(
+          `<div class="topup-status warn">⏳ Ein Nachkauf liegt bereits auf einer Rechnung, die noch nicht validiert ist. Der nächste Nachkauf wird möglich, sobald diese validiert wurde.</div>`
+        );
+      }
+      let action = "";
+      if (t && t.allowed && this._toNum(t.amountEur) > 0) {
+        action = `
+          <div class="topup-actions">
+            <button type="button" class="btn-primary" id="topup-start">Nachkauf starten — ${this._esc(this._eur(t.amountEur, cur) || "–")} auf Rechnung</button>
+          </div>`;
+      } else if (t && Array.isArray(t.reasons) && t.reasons.length > 0) {
+        stateParts.push(`<div class="topup-blocked">Nachkauf aktuell nicht möglich:${this._topupReasonsHtml(t.reasons)}</div>`);
+      } else if (t && !t.allowed && !pending) {
+        stateParts.push(`<div class="topup-blocked">Nachkauf aktuell nicht möglich. Bitte kontaktiere deinen Dienstleister.</div>`);
+      }
+      if (this._topupBlockedReasons) {
+        stateParts.push(`<div class="topup-blocked">Der Nachkauf wurde abgelehnt:${this._topupReasonsHtml(this._topupBlockedReasons)}</div>`);
+      }
+      if (this._topupError) {
+        stateParts.push(`<div class="topup-status warn">⚠ ${this._esc(this._topupError)}</div>`);
+      }
+      if (unresolved) {
+        stateParts.push(`
+          <div class="topup-status warn">⚠ Es gibt einen noch nicht abgeschlossenen Nachkauf-Auftrag (Ergebnis unklar). Erneutes Senden ist sicher — derselbe Auftrag wird fortgesetzt, nichts wird doppelt gekauft.</div>
+          <div class="topup-actions"><button type="button" class="btn-primary" id="topup-retry">Auftrag erneut senden</button></div>`);
+      }
+      inner = `${expl}<div class="topup-state">${stateParts.join("")}</div>${action}`;
+    }
+
+    return `
+      <div class="topup-card">
+        <div class="topup-head">
+          <strong>KI-Guthaben &amp; Nachkauf</strong>
+          <button type="button" class="conv-del" id="topup-x" title="Schließen">✕</button>
+        </div>
+        ${inner}
+      </div>`;
+  }
+
+  /** Warn-Hinweis auf dem €-Chip: offener Auftrag, Pending oder leerer Chat. */
+  _topupAlert() {
+    const t = this._config && this._config.topup;
+    const q = this._config && this._config.quota;
+    if (this._topupRequestId && this._topupStage !== "done") return true;
+    if (t && t.pending) return true;
+    if (q && q.exceeded && t && t.allowed) return true;
+    return false;
+  }
+
 
   async _handleImageFile(file) {
     if (!file) return;
@@ -1099,7 +1502,7 @@ class AllroggenChatPanel extends HTMLElement {
     return out.join("\n").replace(/\n/g, "<br>");
   }
 
-  /** Kontingent-Ring im Header: nur Prozent, keine Euro-Werte. */
+  /** Kontingent-Ring im Header: Prozent des Inklusivbudgets; EUR-Details in der Zeile darunter. */
   _quotaHtml() {
     const q = this._config && this._config.quota;
     if (!q || q.costLimit == null) return ""; // ohne Limit keine Kontingent-Anzeige
@@ -1108,8 +1511,13 @@ class AllroggenChatPanel extends HTMLElement {
       : 100;
     const cls = q.exceeded ? "quota-exceeded" : q.warning ? "quota-warning" : "";
     const reset = new Date(q.resetsAt).toLocaleDateString("de-DE");
+    const cur = q.currency || "EUR";
+    const credit = this._toNum(q.creditRemainingEur);
+    const creditInfo = credit != null && credit > 0
+      ? ` · Gekauftes Guthaben: ${this._esc(this._eur(credit, cur))} (wird nach dem Inklusivbudget verbraucht)`
+      : "";
     return `
-      <div class="quota ${cls}" title="${pct} % des Monatskontingents verbraucht · Reset am ${reset}">
+      <div class="quota ${cls}" title="${pct} % des Monatskontingents verbraucht · Reset am ${reset}${creditInfo}">
         <svg viewBox="0 0 36 36" class="quota-ring" role="img" aria-label="${pct} % des Monatskontingents verbraucht">
           <circle class="ring-track" cx="18" cy="18" r="15.9155"></circle>
           <circle class="ring-fill" cx="18" cy="18" r="15.9155" stroke-dasharray="${pct} ${100 - pct}"></circle>
@@ -1232,6 +1640,9 @@ class AllroggenChatPanel extends HTMLElement {
     // Reparaturen-Zähler — nur eben im Panel, HA-Seitenleiste bietet dafür
     // für Custom Panels keine Badge-API).
     const unseenCount = this._unseenCount();
+    const hasTopup = !!(this._config && this._config.topup);
+    const quotaInfo = this._quotaInfoHtml();
+    const topupAlert = this._topupAlert();
 
     const wrapClasses = [
       "wrap",
@@ -1327,6 +1738,33 @@ class AllroggenChatPanel extends HTMLElement {
         .error-banner { background: #fdecea; color: #b71c1c; padding: 10px 14px; border-radius: 12px; font-size: 13px; }
         .notice { background: var(--secondary-background-color, #fff8e1); color: var(--primary-text-color, #795548); padding: 10px 14px; border-radius: 12px; font-size: 13px; }
 
+        /* KI-Guthaben / Nachkauf */
+        .quota-info { font-size: 12px; color: var(--secondary-text-color, #666); }
+        .quota-info strong { color: var(--primary-text-color, #222); font-weight: 600; }
+        .icon-btn#topup-toggle { font-weight: 700; }
+        .topup-card { border: 1px solid var(--divider-color, #e2e2e2); border-radius: 12px; background: var(--card-background-color, #fff); padding: 12px 14px; font-size: 13px; color: var(--primary-text-color, #222); }
+        .topup-card p { margin: 6px 0; line-height: 1.45; }
+        .topup-card code { font-family: monospace; background: rgba(127,127,127,0.15); padding: 1px 4px; border-radius: 4px; word-break: break-all; }
+        .topup-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 4px; }
+        .topup-head strong { font-size: 14px; }
+        .topup-head .conv-del { position: static; }
+        .topup-status { padding: 9px 12px; border-radius: 10px; margin: 6px 0; line-height: 1.45; }
+        .topup-status.ok { background: #e8f5e9; color: #1b5e20; }
+        .topup-status.warn { background: #fff8e1; color: #795548; }
+        .topup-confirm-line { background: #fff8e1; border: 1px solid #f5e1a4; color: #795548; padding: 10px 12px; border-radius: 10px; font-size: 14px; margin: 6px 0; }
+        .topup-details { margin: 6px 0; padding-left: 20px; }
+        .topup-details li { margin: 3px 0; line-height: 1.4; }
+        .topup-reasons { margin: 4px 0 0; padding-left: 20px; }
+        .topup-reasons li { margin: 3px 0; line-height: 1.4; }
+        .topup-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
+        .btn-primary { padding: 9px 14px; border-radius: 10px; background: var(--primary-color, #03a9f4); color: #fff; font-size: 13px; font-weight: 600; }
+        .btn-primary:hover:not(:disabled) { filter: brightness(1.1); }
+        .btn-secondary { padding: 9px 14px; border-radius: 10px; background: var(--secondary-background-color, #eee); color: var(--primary-text-color, #222); font-size: 13px; }
+        .btn-secondary:hover:not(:disabled) { filter: brightness(0.97); }
+        .btn-danger { padding: 9px 14px; border-radius: 10px; background: #d32f2f; color: #fff; font-size: 13px; font-weight: 600; }
+        .btn-danger:hover:not(:disabled) { filter: brightness(1.1); }
+        .topup-blocked { background: var(--secondary-background-color, #f3f3f3); border-radius: 10px; padding: 8px 12px; margin-top: 6px; }
+
         /* Bild-Vorschau-Chip */
         .img-preview { display: flex; align-items: center; gap: 10px; padding: 8px; border-radius: 12px; border: 1px solid var(--divider-color, #ddd); background: var(--card-background-color, #fff); }
         .img-preview img { width: 56px; height: 56px; object-fit: cover; border-radius: 8px; }
@@ -1368,11 +1806,14 @@ class AllroggenChatPanel extends HTMLElement {
             <h1>${this._esc(agentName)}</h1>
           </div>
           ${this._quotaHtml()}
+          ${hasTopup || quotaInfo ? `<button type="button" class="icon-btn badged" id="topup-toggle" title="KI-Guthaben & Nachkauf">€${topupAlert ? `<span class="toggle-badge">!</span>` : ""}</button>` : ""}
         </div>
         ${this._modelHtml()}
+        ${quotaInfo}
         ${this._error ? `<div class="error-banner">${this._esc(this._error)}</div>` : ""}
         ${noAgent ? `<div class="notice">Der Chat ist für deinen Zugang noch nicht eingerichtet. Bitte kontaktiere deinen Dienstleister.</div>` : ""}
-        ${quotaExceeded ? `<div class="notice">Monatliches Chat-Kontingent erschöpft — der Chat ist bis zum Reset pausiert.</div>` : ""}
+        ${this._quotaNoticeHtml()}
+        ${this._topupHtml()}
         <div class="body">
           ${this._sidebarHtml()}
           <div class="main">
@@ -1424,6 +1865,28 @@ class AllroggenChatPanel extends HTMLElement {
     if (rmimg) rmimg.addEventListener("click", () => { this._clearPendingImage(); this._render(); });
     const mic = this.shadowRoot.getElementById("mic");
     if (mic) mic.addEventListener("click", () => this._toggleSpeech());
+    // ---- KI-Guthaben / Nachkauf -------------------------------------------
+    const topupToggle = this.shadowRoot.getElementById("topup-toggle");
+    if (topupToggle) topupToggle.addEventListener("click", () => {
+      this._topupOpen = !this._topupOpen;
+      this._render();
+    });
+    const topupX = this.shadowRoot.getElementById("topup-x");
+    if (topupX) topupX.addEventListener("click", (e) => { e.stopPropagation(); this._topupClose(); });
+    const topupStart = this.shadowRoot.getElementById("topup-start");
+    if (topupStart) topupStart.addEventListener("click", () => this._topupStartConfirm());
+    const topupConfirm = this.shadowRoot.getElementById("topup-confirm");
+    if (topupConfirm) topupConfirm.addEventListener("click", () => this._sendTopup());
+    const topupBack = this.shadowRoot.getElementById("topup-back");
+    if (topupBack) topupBack.addEventListener("click", () => this._topupCancel());
+    // Retry nach unklarem Ergebnis: derselbe Auftrag (gleiche requestId),
+    // niemals eine neue ID — der Server löst Idempotenz/Blockade auf.
+    const topupRetry = this.shadowRoot.getElementById("topup-retry");
+    if (topupRetry) topupRetry.addEventListener("click", () => this._sendTopup(true));
+    const topupCloseBtn = this.shadowRoot.getElementById("topup-close");
+    if (topupCloseBtn) topupCloseBtn.addEventListener("click", () => this._topupClose());
+    const topupClose2 = this.shadowRoot.getElementById("topup-close2");
+    if (topupClose2) topupClose2.addEventListener("click", () => this._topupClose());
     const msgInput = this.shadowRoot.getElementById("msg");
     if (prevValue) msgInput.value = prevValue;
     this._autoGrow(msgInput);

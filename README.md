@@ -29,7 +29,8 @@ Home Assistant des Kunden arbeiten (Automationen, Dashboards, Helfer).
 | 🎤 **Spracheingabe** | Diktieren statt tippen (Web Speech API, Deutsch). Erfordert Chrome oder Edge — in Firefox wird der Button nicht angezeigt |
 | ⏹️ **Abbrechen** | Ein laufender Turn lässt sich jederzeit per „Abbrechen"-Button stoppen |
 | 🔔 **Ungesehene Antworten** | Roter Zähler am Unterhaltungs-Button und „neu"-Markierung pro Unterhaltung, wenn Antworten oder Rückfragen noch ungelesen sind — auch über Sitzungen hinweg |
-| 📊 **Kontingent im Blick** | Prozent-Ring fürs Monatskontingent und Tokensumme pro Unterhaltung — ganz ohne Preise |
+| 📊 **Budget & Guthaben im Blick** | Prozent-Ring fürs inklusive Monatsbudget, dazu eine EUR-Zeile: wie viel Inklusivbudget diesen Monat übrig ist und wie viel gekauftes Guthaben noch steht |
+| 💶 **Nachkauf auf Rechnung** | Ist alles aufgebraucht, kannst du einmalig deinen vereinbarten Betrag per Knopfdruck auf Rechnung nachbuchen — mit Erklärung und verbindlicher Bestätigung („Kostenpflichtig: X € auf Rechnung nachbuchen"). Bei unklarem Verbindungsresultat wird derselbe Auftrag sicher wiederholt — es wird nie doppelt gekauft |
 | 🔒 **Datenschutz** | Das Kunden-Token bleibt serverseitig — es erreicht nie den Browser |
 
 ## 📋 Voraussetzungen
@@ -61,13 +62,48 @@ Home Assistant des Kunden arbeiten (Automationen, Dashboards, Helfer).
 2. Backend-Adresse (z. B. `https://ticket.example.com`) und Token eintragen
 3. In der Seitenleiste erscheint **Allroggen Support** — fertig 🎉
 
-## 📊 Chat-Kontingent
+## 📊 Chat-Kontingent, Guthaben & Nachkauf
 
-Der Chat hat je nach Vereinbarung ein monatliches Kontingent. Ein Ring oben
-rechts im Panel zeigt in Prozent, wie viel davon bereits verbraucht wurde —
-blau im Normalbereich, orange ab der Warnschwelle, rot bei Überschreitung;
-bei Überschreitung pausiert der Chat bis zum Monatswechsel. Ohne festes
-Limit wird kein Ring angezeigt. Preise zeigt das Panel bewusst nicht.
+Der Chat hat je nach Vereinbarung ein monatliches KI-Budget inklusive
+(z. B. 5 € im Basic Plus). Der Ring oben rechts im Panel zeigt in Prozent,
+wie viel davon bereits verbraucht wurde — blau im Normalbereich, orange ab
+der Warnschwelle, rot bei Überschreitung. Ohne festes Limit wird kein Ring
+angezeigt. Eine Zeile darunter zeigt zusätzlich in Euro, wie viel
+Inklusbudget diesen Monat übrig ist und wie viel **gekauftes Guthaben** noch
+steht.
+
+Wichtige Regeln:
+
+- **Inklusivbudget** gilt pro Monat und wird nicht übertragen — am
+  Monatswechsel (Reset-Datum wird angezeigt) steht es frisch zur Verfügung.
+- **Gekauftes Guthaben** wird erst *nach* dem Inklusivbudget verbraucht,
+  verfällt nicht und bleibt über Monate erhalten.
+- Ist beides aufgebraucht, **pausiert nur die KI-Antwort** — Tickets und
+  Support laufen ganz normal weiter.
+
+### 💶 Nachkauf auf Rechnung
+
+Über den **€-Button** oben im Panel öffnet sich die Guthaben-Karte. Ist ein
+kundenspezifischer Nachkauf-Betrag für dich hinterlegt und frei gegeben,
+führt dich „Nachkauf starten" zur **verbindlichen Bestätigung** — der Button
+nennt den Preis ausdrücklich: *„Kostenpflichtig: X € auf Rechnung
+nachbuchen"*. Ohne diesen Klick wird nie gebucht.
+
+- Nach Annahme durch die Buchhaltung (ERP) ist das Guthaben **sofort**
+  aktiviert; der Betrag wird auf deiner nächsten Rechnung ausgewiesen.
+- Der **nächste Nachkauf** ist erst möglich, wenn der vorherige auf einer
+  validierten Rechnung erfasst ist; überfällige Rechnungen blockieren den
+  Nachkauf. Das Panel zeigt die Gründe verständlich an.
+- Fehlt der gültige KI-Guthaben-Serviceartikel im ERP, bleibt der Nachkauf gesperrt:
+  **„KI-Guthabenartikel noch nicht eingerichtet. Bitte Support kontaktieren.“**
+  Die Einrichtung übernimmt der Dienstleister im ERP, nicht der Browser. Berechtigte manuelle
+  ERP-Rechnungen werden nach Validierung beim nächsten Entitlement-Abgleich als Guthaben sichtbar;
+  Backend und Panel erzeugen dafür keine zusätzliche Gutschrift.
+- Wird die Verbindung während der Buchung unterbrochen, bleibt der Auftrag
+  offen: **„Erneut senden" wiederholt denselben Auftrag** (gleiche
+  Anfrage-ID) — das Backend bucht garantiert nichts doppelt. Erst nach
+  eindeutigem Abschluss erhält ein späterer Kauf eine neue Anfrage-ID.
+
 Zusätzlich zeigt eine dezente Zeile über der Nachrichtenliste die
 Tokensumme der gerade geöffneten Unterhaltung. Unterhaltungen lassen sich
 in der einklappbaren Seitenleiste links wechseln, neu anlegen und löschen.
@@ -96,7 +132,9 @@ Architektur-Grundprinzipien:
   `<backend>/api/customer-chat/*` weiter — Token bleibt serverseitig, kein
   CORS-Problem. Bei 401 vom Backend startet die Integration automatisch den
   Reauth-Flow. Der Pfad `/stream` (SSE) wird nicht gepuffert, sondern Chunk
-  für Chunk durchgereicht.
+  für Chunk durchgereicht. Der Pfad `/topup` (KI-Guthaben-Nachkauf) bekommt
+  einen längeren Timeout, weil das Backend die Buchung serverseitig über
+  das ERP (Rechnung) abwickelt, bevor es antwortet.
 - `panel/allroggen-chat-panel.js` ist eine dependency-freie Webcomponent,
   die per `fetch` mit dem HA-Access-Token gegen die Proxy-View arbeitet.
   Realtime läuft über **SSE (Token-Streaming)**: Das Panel hält einen
@@ -111,5 +149,6 @@ Architektur-Grundprinzipien:
 
 ```bash
 pip install -r requirements_test.txt
-pytest tests/
+pytest tests/            # Proxy/Setup (Python)
+node tests/test_panel_logic.mjs   # Guthaben-/Nachkauf-Logik des Panels (JS)
 ```
