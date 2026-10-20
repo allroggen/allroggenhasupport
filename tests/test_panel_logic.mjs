@@ -108,6 +108,16 @@ globalThis.fetch = (...args) => {
     "known reason credit-awaiting-validated-invoice",
     p._topupReasonText("credit-awaiting-validated-invoice").includes("validierte Rechnung")
   );
+  check(
+    "known reason credit-limit-exceeded",
+    p._topupReasonText("credit-limit-exceeded") ===
+      "Kreditrahmen für offene Nachkäufe erreicht. Bitte Rechnung begleichen/abwarten oder Support kontaktieren."
+  );
+  const limitHtml = p._topupReasonsHtml(["credit-limit-exceeded"]);
+  check(
+    "credit-limit-exceeded freundlich ohne Rohcode",
+    limitHtml.includes("Kreditrahmen") && !limitHtml.includes("credit-limit-exceeded")
+  );
   check("unknown reason enthält code", p._topupReasonText("sonstiges-xyz").includes("sonstiges-xyz"));
   check(
     "known reason credit-product-not-configured",
@@ -160,6 +170,16 @@ globalThis.fetch = (...args) => {
   p._topupStartConfirm();
   check("fehlender Guthabenartikel → kein Kauf oder Bestätigung", fetchCalls.length === 0 && p._topupStage === null);
   check("Config-Grund freundlich gerendert", p._topupReasonsHtml(p._config.topup.reasons).includes("KI-Guthabenartikel noch nicht eingerichtet") && !p._topupReasonsHtml(p._config.topup.reasons).includes("credit-product-not-configured"));
+  p._config = { topup: { allowed: false, amountEur: "10.00", reasons: ["credit-limit-exceeded"] } };
+  fetchCalls = [];
+  p._sendTopup();
+  p._topupStartConfirm();
+  check("Kreditrahmen erreicht → kein Kauf oder Bestätigung", fetchCalls.length === 0 && p._topupStage === null);
+  check(
+    "Kreditrahmen-Grund freundlich gerendert",
+    p._topupReasonsHtml(p._config.topup.reasons).includes("Kreditrahmen") &&
+      !p._topupReasonsHtml(p._config.topup.reasons).includes("credit-limit-exceeded")
+  );
   p._config = { topup: { allowed: true, amountEur: "abc" } };
   p._sendTopup();
   check("ohne Betrag kein Kauf", fetchCalls.length === 0);

@@ -98,6 +98,10 @@ nachbuchen"*. Ohne diesen Klick wird nie gebucht.
 - Der **nächste Nachkauf** ist erst möglich, wenn der vorherige auf einer
   validierten Rechnung erfasst ist; überfällige Rechnungen blockieren den
   Nachkauf. Das Panel zeigt die Gründe verständlich an.
+- Ist der **Kreditrahmen für offene, noch nicht fakturierte Nachkäufe**
+  erreicht (`credit-limit-exceeded`), bleibt der Nachkauf gesperrt, bis die
+  offenen Beträge fakturiert bzw. beglichen sind. Das Panel erklärt auch
+  diesen Grund verständlich und bietet keinen Kauf an.
 - Fehlt der gültige KI-Guthaben-Serviceartikel im ERP, bleibt der Nachkauf gesperrt:
   **„KI-Guthabenartikel noch nicht eingerichtet. Bitte Support kontaktieren.“**
   Die Einrichtung übernimmt der Dienstleister im ERP, nicht der Browser. Berechtigte manuelle

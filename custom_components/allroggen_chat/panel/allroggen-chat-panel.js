@@ -1094,6 +1094,8 @@ class AllroggenChatPanel extends HTMLElement {
         "Der vorherige Nachkauf wartet noch auf eine validierte Rechnung. Der nächste Nachkauf wird möglich, sobald diese validiert ist.",
       "invoice-overdue":
         "Es gibt eine überfällige Rechnung. Bitte zuerst begleichen — danach ist der Nachkauf wieder möglich.",
+      "credit-limit-exceeded":
+        "Kreditrahmen für offene Nachkäufe erreicht. Bitte Rechnung begleichen/abwarten oder Support kontaktieren.",
       "topup-not-configured":
         "Für deinen Vertrag ist kein Nachkauf-Betrag hinterlegt. Bitte kontaktiere deinen Dienstleister.",
       "credit-product-not-configured":
