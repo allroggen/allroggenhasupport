@@ -24,6 +24,7 @@ Home Assistant des Kunden arbeiten (Automationen, Dashboards, Helfer).
 | | |
 |---|---|
 | 💬 **Streaming-Antworten** | Der Agent antwortet Token für Token live (SSE, mit Polling-Fallback) |
+| 🖥️ **Desktop-Chat** | OpenCode-inspiriertes Layout mit kompakter Seitenleiste, flacher Lesespalte, einklappbaren Werkzeugaufrufen und mehrzeiligem Eingabefeld; auf dem Handy als Drawer |
 | 🏠 **Arbeitet direkt in HA** | Automationen, Dashboards, Helfer und Skripte auf Zuruf |
 | 🖼️ **Bild-Upload** | Per 📎-Button Bilder anhängen (clientseitig verkleinert, max. 1600 px). Erfordert ein vision-fähiges Chat-Modell im Ticket-System — der voreingestellte MiniMax-M2 ist reine Text-KI und ignoriert Anhänge |
 | 🎤 **Spracheingabe** | Diktieren statt tippen (Web Speech API, Deutsch). Erfordert Chrome oder Edge — in Firefox wird der Button nicht angezeigt |
@@ -31,7 +32,7 @@ Home Assistant des Kunden arbeiten (Automationen, Dashboards, Helfer).
 | 🔔 **Ungesehene Antworten** | Roter Zähler am Unterhaltungs-Button und „neu"-Markierung pro Unterhaltung, wenn Antworten oder Rückfragen noch ungelesen sind — auch über Sitzungen hinweg |
 | 📊 **Budget & Guthaben im Blick** | Verfügbarer Betrag direkt im Kopf; Monatsbudget, Modell und Tokens unter „Chat-Details“ |
 | 📋 **Nachrichten kopieren** | „Kopieren“ übernimmt den Nachrichtentext inklusive Markdown in die Zwischenablage |
-| ↪ **Ab hier neu starten** | Erstellt nach Bestätigung einen neuen Chat mit dem Verlauf bis einschließlich der ausgewählten Nachricht. Der Originalchat bleibt erhalten; ausgeführte HA-Aktionen werden nicht rückgängig gemacht |
+| ↪ **Verlauf abzweigen** | Erstellt nach Bestätigung einen neuen Chat mit dem Verlauf bis einschließlich der ausgewählten Nachricht. Der Originalchat bleibt erhalten; ausgeführte HA-Aktionen werden nicht rückgängig gemacht. Für einen leeren Kontext stattdessen „Neuer Chat“ wählen |
 | 🔎 **Unterhaltungen verwalten** | Suche nach Titel, Umbenennen und Löschen im Unterhaltungsmenü; letzte Frage zum Bearbeiten übernehmen |
 | 💶 **Nachkauf auf Rechnung** | Ist alles aufgebraucht, kannst du einmalig deinen vereinbarten Betrag per Knopfdruck auf Rechnung nachbuchen — mit Erklärung und verbindlicher Bestätigung („Kostenpflichtig: X € auf Rechnung nachbuchen"). Bei unklarem Verbindungsresultat wird derselbe Auftrag sicher wiederholt — es wird nie doppelt gekauft |
 | 🔒 **Datenschutz** | Das Kunden-Token bleibt serverseitig — es erreicht nie den Browser |
@@ -113,18 +114,38 @@ nachbuchen"*. Ohne diesen Klick wird nie gebucht.
   eindeutigem Abschluss erhält ein späterer Kauf eine neue Anfrage-ID.
 
 Die Chat-Details zeigen außerdem die Tokensumme der geöffneten Unterhaltung.
+Budget- und Inklusivhinweise erscheinen nur noch in den aufklappbaren Details bzw.
+der Guthaben-Karte, nicht als dauerhafter Banner über dem Chat. Bei gesperrtem
+Kontingent erklärt das Eingabefeld die Pause; „Kontingent ansehen“ öffnet die Details.
 Unterhaltungen lassen sich in der einklappbaren Seitenleiste suchen und wechseln.
 Das Menü neben dem Unterhaltungstitel bietet Umbenennen, Löschen und „Letzte Frage
-bearbeiten“. Umbenennen und „Ab hier neu starten“ benötigen die entsprechenden
+bearbeiten“. Umbenennen und „Verlauf abzweigen“ benötigen die entsprechenden
 neuen Backend-Endpunkte; Kopieren funktioniert auch mit älteren Backends
 (Zwischenablage erfordert HTTPS oder localhost und Browser-Berechtigung).
 
 Bei Versandfehlern bleibt der Text als Entwurf erhalten. Ist der Versandstatus
 unklar, zuerst **Verlauf prüfen**: Die Nachricht könnte bereits angenommen worden
-sein. Das Panel sendet nie automatisch erneut. „Ab hier neu starten“ kopiert
+sein. Das Panel sendet nie automatisch erneut. „Verlauf abzweigen“ kopiert
 den Verlauf einschließlich Bildreferenzen, ruft aber keine KI oder HA-Werkzeuge
 auf und kopiert keine alten Kostenbuchungen. Spätere Antworten nutzen den kopierten
 Verlauf als Kontext und können dadurch erneut Kontextkosten verursachen.
+
+### Kontextfenster und Token-Budget
+
+Wenn das Backend `usage.lastInputTokens` und ein Kontextfenster liefert, zeigt das
+Eingabefeld den tatsächlichen Kontextfüllstand (ab 85 % mit Empfehlung für einen
+neuen Chat). Die kumulierte Tokensumme wird **nicht** als Kontextfüllstand verwendet.
+„Neuer Chat“ öffnet eine leere Unterhaltung **ohne kopierten Verlauf**, ohne KI-Aufruf
+und ohne HA-Änderungen rückgängig zu machen. Benötigte Informationen bitte kurz neu
+beschreiben. „Verlauf abzweigen“ (früher „Ab hier neu starten“) kopiert dagegen den alten Verlauf und spart daher
+keinen Kontext.
+
+Die Meldung **„Token-Budget erreicht“** kommt aus dem Support-Backend. Sie ist nicht
+gleichbedeutend mit einem vollen Kontextfenster oder aufgebrauchtem Euro-Guthaben.
+Ein frischer Chat setzt dieses serverseitige Budget nicht automatisch zurück.
+Der Dienstleister muss dort das Limit und den Verbrauch durch Werkzeugaufrufe prüfen.
+Diese Integration steuert weder Modellschleifen noch automatische Kontext-Komprimierung;
+eingeklappte Werkzeugdetails sparen Bildschirmplatz, keine abgerechneten Tokens.
 
 ## 🛠️ Fehlerbehebung
 
@@ -135,6 +156,8 @@ Verlauf als Kontext und können dadurch erneut Kontextkosten verursachen.
 | „Chat ist nicht eingerichtet" im Panel | Für den Kunden ist kein Chat-Agent hinterlegt — Dienstleister kontaktieren |
 | Panel fehlt nach Update | Browser-Cache leeren / harte Aktualisierung (Strg+F5) |
 | `ALL_TARGETS_SKIPPED` / KI-Dienst nicht verfügbar | Im KI-Router wurden alle Ziele ausgeschlossen. Dienstleister prüft Modellroute, Anbieter-Limits und Sperrzeiten. Kundenguthaben ist davon getrennt; technische Details und Zeitpunkt angeben. |
+| „Token-Budget erreicht“ trotz Euro-Guthaben | Separates Limit im Support-Backend prüfen lassen. Guthaben-Nachkauf oder ein neuer Chat hebt dieses Limit nicht automatisch auf. |
+| Kontextfenster voll | „Neuer Chat“ wählen und Ziel kurz beschreiben, statt den gesamten Verlauf über „Verlauf abzweigen“ zu kopieren. |
 
 ## 🔑 Token erneuern (Reauth)
 
@@ -172,7 +195,10 @@ pip install -r requirements_test.txt
 pytest tests/            # Proxy/Setup (Python)
 node tests/test_panel_logic.mjs   # Guthaben-/Nachkauf-Logik des Panels (JS)
 node tests/test_panel_recovery.mjs # einschließlich Versand-/Streaming-/Aktionsregressionen
+node tests/test_panel_ui.mjs       # Werkzeuggruppen, Kontextanzeige und Token-Limit-Hinweise
 ```
 
 Für eine lokale UI-Prüfung mit synthetischen Daten: `python3 -m http.server 8766`
 und `http://localhost:8766/tests/panel-preview.html` öffnen. Keine echte HA-Verbindung nötig.
+Varianten: `?light` (hell), `?scenario=empty` (Startansicht) und
+`?scenario=limit` (Token-Fehler, erschöpftes Kontingent, hoher Kontextfüllstand).

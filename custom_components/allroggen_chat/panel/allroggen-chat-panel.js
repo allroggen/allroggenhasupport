@@ -31,11 +31,15 @@ const ICON_PAPERCLIP =
 const ICON_MIC =
   '<svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor" aria-hidden="true"><path d="M12,2A3,3 0 0,1 15,5V11A3,3 0 0,1 12,14A3,3 0 0,1 9,11V5A3,3 0 0,1 12,2M19,11C19,14.53 16.39,17.44 13,17.93V21H11V17.93C7.61,17.44 5,14.53 5,11H7A5,5 0 0,0 12,16A5,5 0 0,0 17,11H19Z"/></svg>';
 const ICON_SEND =
-  '<svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor" aria-hidden="true"><path d="M2,21L23,12L2,3V10L17,12L2,14V21Z"/></svg>';
+  '<svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor" aria-hidden="true"><path d="M4,12L5.41,13.41L11,7.83V20H13V7.83L18.59,13.41L20,12L12,4L4,12Z"/></svg>';
 // mdi:forum — Unterhaltungsliste (bewusst KEIN Hamburger, damit der Button
 // nicht mit HAs eigenem Sidebar-Toggle verwechselt wird).
 const ICON_FORUM =
   '<svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor" aria-hidden="true"><path d="M17,12V3A1,1 0 0,0 16,2H3A1,1 0 0,0 2,3V17L6,13H16A1,1 0 0,0 17,12M21,6H19V15H6V17A1,1 0 0,0 7,18H18L22,22V7A1,1 0 0,0 21,6Z"/></svg>';
+const ICON_PLUS =
+  '<svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor" aria-hidden="true"><path d="M19,13H13V19H11V13H5V11H11V5H13V11H19V13Z"/></svg>';
+const ICON_SIDEBAR =
+  '<svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor" aria-hidden="true"><path d="M3,3H21A1,1 0 0,1 22,4V20A1,1 0 0,1 21,21H3A1,1 0 0,1 2,20V4A1,1 0 0,1 3,3M4,5V19H8V5H4M10,5V19H20V5H10Z"/></svg>';
 
 class AllroggenChatPanel extends HTMLElement {
   constructor() {
@@ -249,6 +253,12 @@ class AllroggenChatPanel extends HTMLElement {
     const raw = String(text || "");
     if (/ALL_TARGETS_SKIPPED|pre-dispatch filters/i.test(raw)) {
       return "Der KI-Dienst hat gerade kein verfügbares Modell für diese Anfrage. Bitte versuche es später erneut. Bleibt das Problem bestehen, kontaktiere den Support mit dem Fehlercode ALL_TARGETS_SKIPPED.";
+    }
+    if (/Token[- ]Budget erreicht|token[_ -]budget[_ -](?:exceeded|reached)/i.test(raw)) {
+      return "Das Token-Budget des Support-Dienstes ist erreicht. Der Support muss das serverseitige Limit prüfen. Ein neuer Chat oder zusätzliches Euro-Guthaben setzt dieses Token-Limit nicht automatisch zurück.";
+    }
+    if (/context[_ -](?:length[_ -]exceeded|window[_ -]exceeded)|maximum context length|Kontext(?:fenster)? (?:ist )?(?:voll|überschritten)/i.test(raw)) {
+      return "Diese Unterhaltung ist für das Kontextfenster des Modells zu lang. Starte einen neuen Chat und beschreibe kurz das aktuelle Ziel. Der bisherige Verlauf bleibt erhalten; Änderungen in Home Assistant werden nicht rückgängig gemacht.";
     }
     if (/HTTP 50[234]|service_unavailable/i.test(raw)) return "Der KI-Dienst ist momentan nicht verfügbar. Bitte versuche es später erneut.";
     return raw || "Die Anfrage konnte nicht verarbeitet werden. Bitte kontaktiere den Support.";
@@ -523,14 +533,16 @@ class AllroggenChatPanel extends HTMLElement {
   _updateUsageLine() {
     const el = this.shadowRoot && this.shadowRoot.getElementById("conv-usage");
     const u = this._conversation && this._conversation.usage;
-    if (!el || !u) return; // the state=done re-render adds the line if missing
-    el.textContent = this._usageText(u);
+    if (el && u) el.textContent = this._usageText(u);
+    const context = this.shadowRoot && this.shadowRoot.getElementById("context-status");
+    if (context) context.innerHTML = this._contextHtml();
   }
 
   // ---- Conversations -------------------------------------------------------
 
   async _openConversation(id) {
     this._clearDraft();
+    this._menuOpen = false;
     // Beim Öffnen einer Unterhaltung immer ans Ende springen.
     this._nearBottom = true;
     this._unseenBelow = false;
@@ -682,7 +694,7 @@ class AllroggenChatPanel extends HTMLElement {
   }
 
   _messageActionsHtml(m) {
-    return `<div class="message-actions"><button type="button" class="message-action" data-copy="${m.id}" aria-label="Nachricht kopieren">Kopieren</button><button type="button" class="message-action" data-fork="${m.id}" title="Neue Unterhaltung bis zu dieser Nachricht · keine HA-Änderungen rückgängig machen" ${this._busy || this._forking ? "disabled" : ""}>Ab hier neu starten</button></div>`;
+    return `<div class="message-actions"><button type="button" class="message-action" data-copy="${m.id}" aria-label="Nachricht kopieren">Kopieren</button><button type="button" class="message-action" data-fork="${m.id}" title="Neue Unterhaltung mit Verlauf bis zu dieser Nachricht · spart keinen Kontext · keine HA-Änderungen rückgängig machen" ${this._busy || this._forking ? "disabled" : ""}>Verlauf abzweigen</button></div>`;
   }
 
   async _send() {
@@ -771,6 +783,8 @@ class AllroggenChatPanel extends HTMLElement {
   _autoGrow(el) {
     el.style.height = "auto";
     el.style.height = `${Math.min(el.scrollHeight, 132)}px`;
+    const send = this.shadowRoot.getElementById("send");
+    if (send) send.disabled = el.disabled || (!el.value.trim() && !this._pendingImage);
   }
 
   _startPolling(conversationId, afterMessageId) {
@@ -1482,6 +1496,7 @@ class AllroggenChatPanel extends HTMLElement {
       } catch (_) { /* localStorage nicht verfügbar */ }
     }
     this._render();
+    this.shadowRoot.getElementById(this._narrow && this._drawerOpen ? "new" : "conv-toggle").focus();
   }
 
   _selectConversation(id) {
@@ -1563,11 +1578,13 @@ class AllroggenChatPanel extends HTMLElement {
       .join("");
     return `
       <aside class="sidebar" aria-label="Unterhaltungen" ${this._narrow && !this._drawerOpen ? "inert" : ""}>
-        <button type="button" class="new-btn" id="new">+ Neue Unterhaltung</button>
+        <button type="button" class="new-btn" id="new">${ICON_PLUS} Neuer Chat</button>
         <input type="search" id="conv-search" aria-label="Unterhaltungen durchsuchen" placeholder="Unterhaltungen suchen…" value="${this._esc(this._search)}" />
+        <div class="sidebar-label">Unterhaltungen <span>${this._conversations.length}</span></div>
         <div class="conv-list" id="conv-list">
           ${cards || `<div class="conv-empty">${this._search ? "Keine passende Unterhaltung." : "Noch keine Unterhaltungen."}</div>`}
         </div>
+        <div class="sidebar-footer"><span class="status-dot ${this._sseOk ? "online" : ""}"></span><span role="status">${!this._config ? "Verbinden…" : this._sseOk ? "Live verbunden" : "Verlauf wird abgeglichen"}</span></div>
       </aside>
       <div class="backdrop" id="backdrop"></div>`;
   }
@@ -1700,6 +1717,16 @@ class AllroggenChatPanel extends HTMLElement {
     return `<div class="conv-usage" id="conv-usage">${this._esc(this._usageText(u))}</div>`;
   }
 
+  /** Kontext ist die letzte Eingabe, NICHT die kumulierte Token-Abrechnung. */
+  _contextHtml() {
+    const u = this._conversation?.usage;
+    const input = Number(u?.lastInputTokens);
+    const window = Number(u?.contextWindowTokens || this._config?.contextWindowTokens);
+    if (!(input > 0) || !(window > 0) || !Number.isFinite(input) || !Number.isFinite(window)) return "";
+    const pct = Math.round(input / window * 100);
+    return `<span class="context-meter ${pct >= 85 ? "context-warning" : ""}" title="${pct} % des Kontextfensters belegt · Ein neuer Chat startet ohne alten Verlauf"><span class="context-track"><span style="width:${Math.min(pct, 100)}%"></span></span>Kontext ${pct} %${pct >= 85 ? " · Neuer Chat empfohlen" : ""}</span>`;
+  }
+
   /** Zeitstempel unter einer Nachricht (HH:MM, de-DE). */
   _timeHtml(m) {
     const d = new Date(m.sentAt);
@@ -1729,7 +1756,7 @@ class AllroggenChatPanel extends HTMLElement {
       return `<div class="msg user"><div class="bubble">${img}${this._md(m.content)}</div>${this._timeHtml(m)}${this._messageActionsHtml(m)}</div>`;
     }
     if (role === "tool") {
-      return `<div class="msg tool">⚙️ ${this._esc(m.content).slice(0, 120)}</div>`;
+      return `<div class="tool-entry"><pre>${this._esc(m.content)}</pre></div>`;
     }
     if (role === "error") {
       const friendly = this._friendlyError(m.content);
@@ -1741,7 +1768,7 @@ class AllroggenChatPanel extends HTMLElement {
 
   _messagesHtml() {
     if (this._conversation === null) {
-      return `<div class="empty"><div class="empty-icon">💬</div><h2>Wie kann ich dir helfen?</h2><p>Fragen zu deinem Smart Home, Automationen oder einem Problem — wir schauen gemeinsam drauf.</p><div class="suggestions">${["Welche Automationen sind gerade aktiv?", "Hilf mir, eine Automation anzupassen.", "Ich habe ein Problem mit meinem Smart Home."].map((s) => `<button type="button" class="btn-secondary suggestion" data-prompt="${this._esc(s)}">${this._esc(s)}</button>`).join("")}</div></div>`;
+      return `<div class="empty"><div class="empty-icon">${ICON_FORUM}</div><div class="eyebrow">ALLROGGEN SUPPORT</div><h2>Was möchtest du angehen?</h2><p>Dein Smart Home. Eine Frage, eine Idee oder ein Problem.<br>Wir kümmern uns gemeinsam darum.</p><div class="suggestions">${["Eine Automation anpassen", "Ein Problem lösen", "Einen Helfer einrichten"].map((s) => `<button type="button" class="suggestion" data-prompt="${this._esc(s)}">${ICON_PLUS}${this._esc(s)}</button>`).join("")}</div></div>`;
     }
     if (this._conversation.messages.length === 0) {
       return `<div class="empty"><div class="empty-icon">⏳</div>Lade…</div>`;
@@ -1749,15 +1776,28 @@ class AllroggenChatPanel extends HTMLElement {
     // Nach Kalendertag gruppieren, Trenner zwischen den Gruppen.
     const parts = [];
     let lastDay = "";
+    let tools = [];
+    const flushTools = () => {
+      if (!tools.length) return;
+      parts.push(`<details class="tool-group" data-state-key="tools-${tools[0].id}"><summary><span class="tool-symbol" aria-hidden="true">↳</span>Home Assistant · ${tools.length} ${tools.length === 1 ? "Werkzeugaufruf" : "Werkzeugaufrufe"}<span class="tool-expand">Details</span></summary>${tools.map((m) => this._messageHtml(m)).join("")}</details>`);
+      tools = [];
+    };
     for (const m of this._conversation.messages) {
       const d = new Date(m.sentAt);
       const dayKey = isNaN(d.getTime()) ? "" : d.toDateString();
       if (dayKey && dayKey !== lastDay) {
+        flushTools();
         parts.push(`<div class="day-sep"><span>${this._dayLabel(d)}</span></div>`);
         lastDay = dayKey;
       }
+      if ((m.role || "").toLowerCase() === "tool") {
+        tools.push(m);
+        continue;
+      }
+      flushTools();
       parts.push(this._messageHtml(m));
     }
+    flushTools();
     return parts.join("");
   }
 
@@ -1799,16 +1839,15 @@ class AllroggenChatPanel extends HTMLElement {
 
     this.shadowRoot.innerHTML = `
       <style>
-        :host { display: block; height: calc(100vh - var(--header-height, 64px)); height: calc(100dvh - var(--header-height, 64px)); }
-        .wrap { display: flex; flex-direction: column; height: 100%; max-height: 100%; overflow: hidden; padding: 16px 16px 12px; box-sizing: border-box; gap: 8px; }
+        :host { display: block; height: calc(100vh - var(--header-height, 64px)); height: calc(100dvh - var(--header-height, 64px)); color: var(--primary-text-color, #242424); font: 14px var(--ha-font-family-body, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif); }
+        * { box-sizing: border-box; }
+        .wrap { --chat-bg: var(--primary-background-color, #fafafa); --chat-panel: var(--card-background-color, #fff); --chat-hover: var(--secondary-background-color, #f0f0f0); --chat-line: color-mix(in srgb, var(--primary-text-color, #242424) 10%, transparent); display: flex; flex-direction: column; height: 100%; max-height: 100%; overflow: hidden; background: var(--chat-bg); }
 
         /* Header */
-        .header { display: flex; align-items: center; gap: 12px; }
+        .header { display: flex; align-items: center; min-height: 56px; flex-shrink: 0; border-bottom: 1px solid var(--chat-line); gap: 8px; padding-right: 12px; }
         .ha-menu { flex-shrink: 0; margin-left: -8px; color: var(--primary-text-color, #222); }
-        .avatar { width: 42px; height: 42px; border-radius: 50%; flex-shrink: 0; display: flex; align-items: center; justify-content: center; font-size: 18px; font-weight: 600; color: #fff; background: var(--primary-color, #03a9f4); background: linear-gradient(135deg, var(--primary-color, #03a9f4), var(--accent-color, #5c6bc0)); overflow: hidden; }
+        .avatar { width: 26px; height: 26px; border-radius: 6px; flex-shrink: 0; display: flex; align-items: center; justify-content: center; overflow: hidden; }
         .avatar img { width: 100%; height: 100%; object-fit: cover; display: block; }
-        .header-text { flex: 1; min-width: 0; }
-        .header h1 { font-size: 18px; margin: 0; font-weight: 600; }
         .quota { flex-shrink: 0; display: flex; align-items: center; }
         .quota-ring { width: 38px; height: 38px; display: block; }
         .quota-ring .ring-track { fill: none; stroke: var(--divider-color, #ddd); stroke-width: 3.5; }
@@ -1824,53 +1863,48 @@ class AllroggenChatPanel extends HTMLElement {
         button:focus-visible { outline: 2px solid var(--primary-color, #03a9f4); outline-offset: 1px; }
 
         /* Body: Sidebar + Hauptspalte — nur .messages bzw. .conv-list scrollen */
-        .body { position: relative; flex: 1; min-height: 0; display: flex; gap: 12px; }
-        .main { flex: 1; min-width: 0; min-height: 0; display: flex; flex-direction: column; gap: 8px; }
-        .sidebar { width: 240px; flex-shrink: 0; min-height: 0; display: flex; flex-direction: column; gap: 8px; }
+        .body { position: relative; flex: 1; min-height: 0; display: flex; }
+        .main { position: relative; flex: 1; min-width: 0; min-height: 0; display: flex; flex-direction: column; }
+        .sidebar { width: 256px; flex-shrink: 0; min-height: 0; display: flex; flex-direction: column; gap: 8px; padding: 16px 12px 0; background: var(--chat-panel); border-right: 1px solid var(--chat-line); }
         .sidebar-collapsed .sidebar { display: none; }
-        .new-btn { padding: 9px 14px; border-radius: 10px; background: var(--primary-color, #03a9f4); color: #fff; font-size: 13px; font-weight: 600; }
         .new-btn:hover { filter: brightness(1.1); }
-        .conv-list { flex: 1; min-height: 0; overflow-y: auto; display: flex; flex-direction: column; gap: 6px; padding-right: 2px; }
+        .conv-list { flex: 1; min-height: 0; overflow-y: auto; display: flex; flex-direction: column; gap: 3px; padding-right: 2px; }
         .conv-list::-webkit-scrollbar { width: 6px; }
         .conv-list::-webkit-scrollbar-thumb { background: var(--divider-color, #ccc); border-radius: 3px; }
         .conv-list::-webkit-scrollbar-track { background: transparent; }
-        .conv-card { position: relative; text-align: left; width: 100%; padding: 10px 12px; border-radius: 12px; border: 1px solid var(--divider-color, #e2e2e2); border-left: 3px solid transparent; background: var(--card-background-color, #fff); cursor: pointer; }
+        .conv-card { position: relative; text-align: left; width: 100%; padding: 10px 12px; border-radius: 6px; border: 1px solid transparent; background: transparent; cursor: pointer; }
         .conv-card:hover { background: var(--secondary-background-color, #f3f3f3); }
-        .conv-card.active { border-left-color: var(--primary-color, #03a9f4); background: var(--secondary-background-color, #f3f3f3); }
-        .conv-title { font-size: 13px; font-weight: 500; color: var(--primary-text-color, #222); display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
-        .conv-card.active .conv-title { padding-right: 20px; }
+        .conv-card.active { background: var(--chat-hover); border-color: var(--chat-line); }
+        .conv-title { font-size: 13px; font-weight: 500; color: var(--primary-text-color, #222); display: block; white-space: nowrap; text-overflow: ellipsis; overflow: hidden; }
         .conv-date { font-size: 11px; color: var(--secondary-text-color, #888); margin-top: 4px; }
         .conv-new { display: inline-block; margin-left: 6px; padding: 1px 7px; border-radius: 999px; background: var(--error-color, #db4437); color: #fff; font-size: 10px; font-weight: 600; vertical-align: 1px; }
         .conv-del { position: absolute; top: 6px; right: 6px; width: 22px; height: 22px; border-radius: 50%; background: transparent; color: var(--secondary-text-color, #888); font-size: 11px; display: flex; align-items: center; justify-content: center; }
         .conv-del:hover { background: #fdecea; color: #b71c1c; }
         .conv-empty { font-size: 12px; color: var(--secondary-text-color, #888); text-align: center; padding: 16px 8px; }
         .backdrop { display: none; }
-        .narrow .sidebar { position: absolute; left: 0; top: 0; bottom: 0; z-index: 5; width: 260px; padding: 8px; background: var(--card-background-color, #fff); border-right: 1px solid var(--divider-color, #ddd); box-shadow: 2px 0 12px rgba(0,0,0,0.25); transform: translateX(-110%); transition: transform 0.2s ease; }
+        .narrow .sidebar { position: absolute; left: 0; top: 0; bottom: 0; z-index: 5; width: min(300px, calc(100% - 40px)); padding: 16px 12px 0; background: var(--chat-panel); box-shadow: 2px 0 12px rgba(0,0,0,0.15); transform: translateX(-110%); transition: transform 0.2s ease; }
         .narrow.drawer-open .sidebar { transform: none; }
         .narrow.drawer-open .backdrop { display: block; position: absolute; inset: 0; z-index: 4; background: rgba(0,0,0,0.35); }
 
         /* Nachrichten */
         .messages-wrap { position: relative; flex: 1; min-height: 0; display: flex; }
-        .messages { flex: 1; min-height: 0; overflow-y: auto; padding: 12px 6px; display: flex; flex-direction: column; gap: 10px; }
-        .day-sep { display: flex; align-items: center; justify-content: center; margin: 4px 0 0; }
-        .day-sep span { font-size: 11px; color: var(--secondary-text-color, #888); background: var(--secondary-background-color, #eee); padding: 3px 12px; border-radius: 999px; }
+        .messages { flex: 1; min-width: 0; min-height: 0; overflow-y: auto; padding: 32px max(28px, calc((100% - 800px) / 2)); display: flex; flex-direction: column; gap: 24px; scrollbar-gutter: stable; }
+        .day-sep { display: flex; align-items: center; gap: 12px; margin: 4px 0; }
+        .day-sep::after { content: ""; flex: 1; border-top: 1px solid var(--chat-line); }
+        .day-sep span { font-size: 11px; color: var(--secondary-text-color, #888); }
         .messages::-webkit-scrollbar { width: 6px; }
         .messages::-webkit-scrollbar-thumb { background: var(--divider-color, #ccc); border-radius: 3px; }
         .messages::-webkit-scrollbar-track { background: transparent; }
-        .empty { margin: auto; padding: 24px; text-align: center; color: var(--secondary-text-color, #666); }
-        .empty .empty-icon { font-size: 40px; margin-bottom: 8px; }
         .msg { display: flex; flex-direction: column; align-items: flex-start; }
-        .msg.user { align-items: flex-end; }
-        .msg.tool { align-items: center; font-size: 12px; font-style: italic; color: var(--secondary-text-color, #888); }
-        .bubble { max-width: 78%; padding: 10px 14px; border-radius: 16px; border-bottom-left-radius: 4px; background: var(--card-background-color, #fff); border: 1px solid var(--divider-color, #e2e2e2); box-shadow: 0 1px 2px rgba(0,0,0,0.07); color: var(--primary-text-color, #222); line-height: 1.45; word-wrap: break-word; }
-        .msg.user .bubble { background: var(--primary-color, #03a9f4); background: linear-gradient(135deg, var(--primary-color, #03a9f4), color-mix(in srgb, var(--primary-color, #03a9f4) 78%, #000)); color: #fff; border: none; box-shadow: 0 1px 3px rgba(0,0,0,0.18); border-radius: 16px; border-bottom-right-radius: 4px; }
+        .bubble { width: 100%; color: var(--primary-text-color, #222); line-height: 1.75; overflow-wrap: anywhere; }
+        .msg.user .bubble { padding: 14px 18px; border-radius: 8px; background: var(--chat-panel); border: 1px solid var(--chat-line); }
         .bubble.draft { opacity: 0.85; }
-        .bubble.error { background: var(--card-background-color, #fff); color: var(--primary-text-color, #222); border-color: var(--error-color, #db4437); border-left-width: 3px; box-shadow: none; }
+        .bubble.error { padding: 14px 16px; border: 1px solid var(--chat-line); border-left: 2px solid var(--error-color, #db4437); border-radius: 6px; }
         .bubble code { font-family: monospace; background: rgba(127,127,127,0.15); padding: 1px 4px; border-radius: 4px; }
-        .bubble pre { background: rgba(127,127,127,0.15); padding: 8px 10px; border-radius: 8px; overflow-x: auto; white-space: pre-wrap; margin: 6px 0; }
+        .bubble pre { background: rgba(127,127,127,0.15); padding: 8px 10px; border-radius: 8px; overflow-x: auto; white-space: pre-wrap; overflow-wrap: anywhere; margin: 6px 0; }
         .bubble pre code { background: transparent; padding: 0; }
         .bubble ul, .bubble ol { margin: 6px 0; padding-left: 20px; }
-        .meta { font-size: 11px; color: var(--secondary-text-color, #888); margin: 2px 6px 0; }
+        .meta { font-size: 11px; color: var(--secondary-text-color, #888); margin-top: 6px; }
         .bubble.typing { display: inline-flex; gap: 5px; align-items: center; padding: 13px 16px; }
         .bubble.typing .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--secondary-text-color, #999); animation: typing-bounce 1.2s infinite; }
         .bubble.typing .dot:nth-child(2) { animation-delay: 0.15s; }
@@ -1881,13 +1915,12 @@ class AllroggenChatPanel extends HTMLElement {
         img.attachment { display: block; max-width: 250px; border-radius: 12px; margin-bottom: 6px; }
 
         /* Banner */
-        .error-banner { background: var(--card-background-color, #fff); color: var(--primary-text-color, #222); border-left: 3px solid var(--error-color, #db4437); padding: 10px 14px; border-radius: 12px; font-size: 13px; }
+        .error-banner { background: var(--chat-panel); color: var(--primary-text-color, #222); border-left: 2px solid var(--error-color, #db4437); padding: 10px 14px; border-radius: 6px; font-size: 13px; line-height: 1.5; margin-bottom: 10px; }
         .notice { background: var(--secondary-background-color, #fff8e1); color: var(--primary-text-color, #795548); padding: 10px 14px; border-radius: 12px; font-size: 13px; }
 
         /* KI-Guthaben / Nachkauf */
         .quota-info { font-size: 12px; color: var(--secondary-text-color, #666); }
         .quota-info strong { color: var(--primary-text-color, #222); font-weight: 600; }
-        .icon-btn#topup-toggle { font-weight: 700; }
         .topup-card { border: 1px solid var(--divider-color, #e2e2e2); border-radius: 12px; background: var(--card-background-color, #fff); padding: 12px 14px; font-size: 13px; color: var(--primary-text-color, #222); }
         .topup-card p { margin: 6px 0; line-height: 1.45; }
         .topup-card code { font-family: monospace; background: rgba(127,127,127,0.15); padding: 1px 4px; border-radius: 4px; word-break: break-all; }
@@ -1919,86 +1952,116 @@ class AllroggenChatPanel extends HTMLElement {
         .speech-error { font-size: 12px; color: #b71c1c; }
 
         /* Composer */
-        .composer { display: flex; align-items: center; gap: 4px; padding: 6px; border-radius: 24px; border: 1px solid var(--divider-color, #ddd); background: var(--card-background-color, #fff); box-shadow: 0 1px 4px rgba(0,0,0,0.08); }
-        .composer:focus-within { border-color: var(--primary-color, #03a9f4); }
-        .composer textarea#msg { flex: 1; min-width: 0; border: none; background: transparent; padding: 8px 10px; font-size: 14px; font-family: inherit; line-height: 1.45; color: var(--primary-text-color, #222); resize: none; height: 36px; max-height: 132px; overflow-y: auto; }
+        .composer { display: flex; flex-direction: column; gap: 8px; padding: 14px 12px 10px; border-radius: 10px; border: 1px solid var(--chat-line); background: var(--chat-panel); box-shadow: 0 2px 8px rgba(0,0,0,0.04); }
+        .composer:focus-within { border-color: var(--secondary-text-color, #888); }
+        .composer textarea#msg { width: 100%; min-width: 0; border: none; background: transparent; padding: 4px 4px 8px; font-size: 14px; font-family: inherit; line-height: 1.6; color: var(--primary-text-color, #222); resize: none; min-height: 42px; max-height: 132px; overflow-y: auto; }
         .composer textarea#msg:focus, .composer textarea#msg:focus-visible { outline: none; }
-        .icon-btn { width: 36px; height: 36px; flex-shrink: 0; border-radius: 50%; background: transparent; color: var(--secondary-text-color, #666); font-size: 17px; display: flex; align-items: center; justify-content: center; }
+        .icon-btn { width: 36px; height: 36px; flex-shrink: 0; border-radius: 6px; background: transparent; color: var(--secondary-text-color, #666); font-size: 17px; display: flex; align-items: center; justify-content: center; }
         .icon-btn.badged { position: relative; }
         .toggle-badge { position: absolute; top: 1px; right: 1px; min-width: 15px; height: 15px; padding: 0 4px; border-radius: 999px; background: var(--error-color, #db4437); color: #fff; font-size: 10px; font-weight: 600; line-height: 15px; text-align: center; box-sizing: border-box; }
         .icon-btn:hover:not(:disabled) { background: var(--secondary-background-color, #eee); }
         .icon-btn.recording { background: #d32f2f; color: #fff; animation: mic-pulse 1.2s infinite; }
         @keyframes mic-pulse { 0% { opacity: 1; } 50% { opacity: 0.55; } 100% { opacity: 1; } }
-        .send-btn { width: 38px; height: 38px; flex-shrink: 0; border-radius: 50%; background: var(--primary-color, #03a9f4); color: #fff; font-size: 16px; display: flex; align-items: center; justify-content: center; }
+        .send-btn { width: 34px; height: 34px; flex-shrink: 0; border-radius: 6px; background: var(--primary-text-color, #222); color: var(--chat-panel); font-size: 16px; display: flex; align-items: center; justify-content: center; }
         .send-btn:hover:not(:disabled) { filter: brightness(1.1); }
         .cancel-btn { padding: 8px 14px; flex-shrink: 0; border-radius: 19px; background: transparent; border: 1px solid #d32f2f; color: #d32f2f; font-size: 13px; }
         .cancel-btn:hover:not(:disabled) { background: rgba(211,47,47,0.08); }
 
-        @media (max-width: 560px) {
-          .wrap { padding: 8px; }
-          .bubble { max-width: 88%; }
-          .header h1 { font-size: 16px; }
-          .avatar { width: 36px; height: 36px; font-size: 16px; }
-        }
-        /* Ruhige Lesespalte, Theme-Kontrast und Touch-/Tastaturbedienung. */
-        .main { max-width: 960px; margin-inline: auto; }
-        .messages { padding: 16px 4px; gap: 18px; }
-        .bubble { max-width: min(85%, 72ch); line-height: 1.6; }
+        /* Desktop-Arbeitsfläche: flache Lesespalte statt Messenger-Blasen. */
+        .brand { width: 256px; align-self: stretch; flex-shrink: 0; display: flex; align-items: center; gap: 10px; padding: 0 16px; background: var(--chat-panel); border-right: 1px solid var(--chat-line); }
+        .brand-name { font-weight: 600; font-size: 13px; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+        .sidebar-collapsed .brand, .narrow .brand { width: auto; padding-right: 0; border: 0; background: transparent; }
+        .sidebar-collapsed .brand-name, .narrow .brand { display: none; }
+        .conversation-head { flex: 1; min-width: 0; display: flex; align-items: center; gap: 8px; }
+        .conversation-head h1 { font-size: 13px; font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin: 0; }
+        .conversation-head .icon-btn { margin-left: auto; }
+        .header-actions { display: flex; align-items: center; gap: 6px; }
+        .header .credit-btn { background: transparent; border: 1px solid var(--chat-line); padding: 7px 10px; font-size: 12px; border-radius: 6px; white-space: nowrap; }
+        .sidebar-label { display: flex; justify-content: space-between; margin: 16px 10px 2px; font-size: 11px; color: var(--secondary-text-color, #666); }
+        .sidebar-footer { display: flex; align-items: center; gap: 8px; min-height: 48px; flex-shrink: 0; border-top: 1px solid var(--chat-line); color: var(--secondary-text-color, #666); font-size: 11px; padding: 8px; }
+        .status-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--secondary-text-color, #888); flex-shrink: 0; }
+        .status-dot.online { background: #6a9f78; }
+        .new-btn { display: flex; align-items: center; gap: 8px; min-height: 40px; padding: 8px 10px; border-radius: 6px; background: var(--chat-hover); color: var(--primary-text-color, #222); border: 1px solid var(--chat-line); font-size: 13px; font-weight: 500; }
+        #conv-search { font: inherit; font-size: 12px; width: 100%; min-height: 36px; padding: 8px 10px; border-radius: 6px; border: 1px solid var(--chat-line); background: transparent; color: var(--primary-text-color, #222); }
+        #conv-search:focus-visible { outline: 2px solid var(--primary-color, #03a9f4); outline-offset: 1px; }
+        .messages > * { flex-shrink: 0; }
         .bubble p { margin: 8px 0; }
         .bubble details { margin-top: 12px; font-size: 12px; }
         summary { cursor: pointer; padding: 8px 0; }
-        .bubble pre { white-space: pre-wrap; overflow-wrap: anywhere; }
-        .msg.user .bubble { background: var(--secondary-background-color, #eef3f8); color: var(--primary-text-color, #222); border: 1px solid var(--divider-color, #ccc); border-right: 3px solid var(--primary-color, #03a9f4); }
-        .new-btn, .send-btn, .btn-primary { background: var(--primary-color, #03a9f4); color: var(--text-primary-color, #fff); }
-        .new-btn { background: var(--card-background-color, #fff); color: var(--primary-text-color, #222); border: 1px solid var(--divider-color, #ccc); min-height: 44px; }
-        .send-btn { background: var(--primary-text-color, #222); color: var(--card-background-color, #fff); }
-        .icon-btn, .send-btn { min-width: 44px; min-height: 44px; }
-        .connection, .composer-hint { color: var(--secondary-text-color, #666); font-size: 12px; }
-        .connection { margin-top: 4px; }
-        .composer-hint { text-align: center; }
-        .conversation-head { display: flex; align-items: center; min-height: 44px; gap: 8px; }
-        .conversation-head strong { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-        .conversation-actions, .suggestions { display: flex; flex-wrap: wrap; gap: 8px; }
-        .suggestions { justify-content: center; }
-        .suggestion { min-height: 44px; }
+        .composer-shell { width: 100%; max-width: 856px; align-self: center; padding: 8px 28px 18px; flex-shrink: 0; }
+        .composer-toolbar { width: 100%; display: flex; align-items: center; gap: 4px; }
+        .composer-mode { font-size: 12px; font-weight: 500; margin-right: auto; padding-left: 4px; color: var(--secondary-text-color, #666); }
+        .composer-footer { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 8px; margin-top: 8px; min-height: 24px; }
+        .composer-hint { color: var(--secondary-text-color, #666); font-size: 11px; }
+        .context-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
+        .context-meter { display: inline-flex; align-items: center; gap: 6px; font-size: 11px; color: var(--secondary-text-color, #666); }
+        .context-warning { color: var(--warning-color, #b07829); }
+        .context-track { display: inline-flex; width: 28px; height: 4px; background: var(--chat-line); border-radius: 2px; overflow: hidden; }
+        .context-track > span { height: 100%; background: currentColor; }
+        .text-btn { display: inline-flex; align-items: center; gap: 4px; background: transparent; color: var(--secondary-text-color, #666); padding: 4px 0; font-size: 11px; }
+        .text-btn:hover { color: var(--primary-text-color, #222); }
+        .conversation-actions { position: absolute; right: 16px; top: 8px; z-index: 7; width: 240px; padding: 6px; border: 1px solid var(--chat-line); background: var(--chat-panel); border-radius: 8px; box-shadow: 0 8px 30px rgba(0,0,0,0.15); display: flex; flex-direction: column; gap: 2px; }
+        .conversation-actions button { background: transparent; text-align: left; border-radius: 4px; }
+        .conversation-actions button:hover { background: var(--chat-hover); }
+        .conversation-actions #del { color: var(--error-color, #db4437); }
+        .suggestions { display: flex; flex-wrap: wrap; justify-content: center; gap: 8px; margin-top: 28px; }
+        .suggestion { display: flex; align-items: center; gap: 6px; min-height: 40px; padding: 8px 12px; font-size: 12px; border: 1px solid var(--chat-line); border-radius: 6px; background: transparent; color: var(--secondary-text-color, #666); }
+        .suggestion:hover { background: var(--chat-hover); color: var(--primary-text-color, #222); }
         .message-actions { display: flex; flex-wrap: wrap; gap: 4px; }
-        .message-action { background: transparent; color: var(--secondary-text-color, #666); border-radius: 8px; min-height: 36px; padding: 6px 10px; font-size: 12px; }
+        .message-action { background: transparent; color: var(--secondary-text-color, #666); border-radius: 4px; min-height: 32px; padding: 4px 8px; font-size: 11px; }
         .message-action:hover { background: var(--secondary-background-color, #eee); color: var(--primary-text-color, #222); }
-        .narrow .message-action { min-height: 44px; }
-        .empty { max-width: 520px; line-height: 1.6; }
-        .empty h2 { color: var(--primary-text-color, #222); font-size: 23px; }
-        .chat-details { border: 1px solid var(--divider-color, #ccc); border-radius: 12px; padding: 12px; display: flex; flex-wrap: wrap; align-items: center; gap: 12px; }
-        #conv-search { font: inherit; box-sizing: border-box; width: 100%; min-height: 44px; padding: 8px 10px; border-radius: 8px; border: 1px solid var(--divider-color, #ccc); background: var(--card-background-color, #fff); color: var(--primary-text-color, #222); }
-        .narrow .header { flex-wrap: wrap; gap: 6px; }
-        .narrow .header-text { flex-basis: calc(100% - 160px); }
-        .narrow .bubble { max-width: 92%; }
-        .narrow .sidebar { width: min(280px, calc(100% - 32px)); box-sizing: border-box; }
+        @media (hover: hover) { .message-actions { opacity: 0; transition: opacity .15s; } .msg:hover .message-actions, .msg:focus-within .message-actions { opacity: 1; } }
+        .empty { width: 100%; max-width: 600px; margin: auto; padding: 40px 0; line-height: 1.7; text-align: center; color: var(--secondary-text-color, #666); }
+        .empty .empty-icon { display: flex; justify-content: center; margin-bottom: 24px; }
+        .empty-icon svg { width: 32px; height: 32px; }
+        .eyebrow { font-size: 10px; letter-spacing: .15em; }
+        .empty h2 { color: var(--primary-text-color, #222); font-size: 26px; font-weight: 500; letter-spacing: -.03em; margin: 12px 0; }
+        .empty p { font-size: 13px; }
+        .tool-group { color: var(--secondary-text-color, #666); font-size: 12px; border-left: 1px solid var(--chat-line); padding-left: 14px; }
+        .tool-group summary { display: flex; align-items: center; gap: 8px; list-style: none; min-height: 36px; }
+        .tool-group summary::-webkit-details-marker { display: none; }
+        .tool-symbol { font-size: 16px; }
+        .tool-expand { margin-left: auto; font-size: 11px; }
+        .tool-expand::after { content: " +"; }
+        .tool-group[open] .tool-expand::after { content: " −"; }
+        .tool-entry pre { max-height: 240px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; padding: 12px; background: var(--chat-panel); border-radius: 4px; font-size: 11px; line-height: 1.6; }
+        .inspector { position: absolute; top: 8px; right: 16px; width: min(440px, calc(100% - 32px)); max-height: calc(100% - 16px); overflow: auto; z-index: 6; border: 1px solid var(--chat-line); border-radius: 8px; background: var(--chat-panel); box-shadow: 0 8px 30px rgba(0,0,0,0.15); }
+        .chat-details { padding: 16px; display: flex; flex-direction: column; gap: 14px; }
+        .details-head { display: flex; align-items: center; justify-content: space-between; }
+        .details-note { font-size: 12px; color: var(--secondary-text-color, #666); line-height: 1.6; margin: 0; }
+        .inspector .topup-card { border: 0; border-radius: 0; }
+        .img-preview { margin-bottom: 8px; }
+        .narrow .header { gap: 4px; padding: 4px 8px; }
+        .narrow .header .credit-btn { max-width: 100px; overflow: hidden; text-overflow: ellipsis; padding: 6px; font-size: 11px; }
+        .narrow .header .ha-menu { margin-left: -8px; }
+        .narrow .messages { padding: 20px 16px; gap: 20px; }
+        .narrow .composer-shell { padding: 8px 12px max(12px, env(safe-area-inset-bottom)); }
+        .narrow .empty h2 { font-size: 23px; }
+        .narrow .icon-btn, .narrow .send-btn, .narrow .message-action, .narrow .text-btn { min-width: 44px; min-height: 44px; }
+        .narrow .sidebar .new-btn, .narrow #conv-search { min-height: 44px; }
         .narrow .composer-hint { display: none; }
         @media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation: none !important; transition: none !important; scroll-behavior: auto !important; } }
       </style>
       <div class="${wrapClasses}">
         <div class="header">
+          <div class="brand"><div class="avatar"><img id="avatar-img" src="/allroggen_chat_static/logo.svg" alt="" /></div><span class="brand-name">${this._esc(agentName)}</span></div>
           ${this._narrow || this._haNarrow
             ? `<ha-menu-button class="ha-menu" narrow></ha-menu-button>`
             : ""}
-          <button type="button" class="icon-btn badged" id="conv-toggle" aria-label="Unterhaltungen ein-/ausblenden" aria-expanded="${this._narrow ? this._drawerOpen : !this._sidebarCollapsed}" title="Unterhaltungen ein-/ausblenden">${ICON_FORUM}${unseenCount > 0 ? `<span class="toggle-badge">${unseenCount > 9 ? "9+" : unseenCount}</span>` : ""}</button>
-          <div class="avatar"><img id="avatar-img" src="/allroggen_chat_static/logo.svg" alt="" /></div>
-          <div class="header-text">
-            <h1>${this._esc(agentName)}</h1>
-            <div class="connection" role="status">${!this._config ? "Verbindung wird aufgebaut…" : this._sseOk ? "Live-Verbindung aktiv" : "Live-Verbindung wird wiederhergestellt · Verlauf wird abgeglichen"}</div>
+          <button type="button" class="icon-btn badged" id="conv-toggle" aria-label="Unterhaltungen ein-/ausblenden" aria-expanded="${this._narrow ? this._drawerOpen : !this._sidebarCollapsed}" title="Unterhaltungen ein-/ausblenden">${ICON_SIDEBAR}${unseenCount > 0 ? `<span class="toggle-badge">${unseenCount > 9 ? "9+" : unseenCount}</span>` : ""}</button>
+          <div class="conversation-head">
+            <h1>${this._esc(this._conversation?.title || "Neuer Chat")}</h1>
+            ${this._conversation ? `<button type="button" class="icon-btn" id="conversation-menu" aria-label="Unterhaltungsaktionen" aria-expanded="${this._menuOpen}" title="Unterhaltungsaktionen">⋯</button>` : ""}
           </div>
+          <div class="header-actions">
           ${hasTopup || quotaInfo ? `<button type="button" class="btn-secondary credit-btn" id="topup-toggle" aria-expanded="${this._topupOpen}" title="KI-Guthaben & Nachkauf">${this._creditLabel()}${topupAlert ? " · !" : ""}</button>` : ""}
           <button type="button" class="icon-btn" id="details-toggle" aria-label="Chat-Details" aria-expanded="${this._detailsOpen}" title="Chat-Details"><svg viewBox="0 0 24 24" width="22" height="22" fill="currentColor" aria-hidden="true"><path d="M11,7H13V9H11V7M11,11H13V17H11V11M12,2A10,10 0 0,0 2,12A10,10 0 0,0 12,22A10,10 0 0,0 22,12A10,10 0 0,0 12,2M12,4A8,8 0 0,1 20,12A8,8 0 0,1 12,20A8,8 0 0,1 4,12A8,8 0 0,1 12,4Z"/></svg></button>
+          </div>
         </div>
-        ${this._detailsOpen ? `<section class="chat-details" aria-label="Chat-Details">${this._modelHtml()}${quotaInfo}${this._quotaHtml()}${this._usageHtml()}</section>` : ""}
-        ${this._error ? `<div class="error-banner" role="alert">${this._esc(this._error)} <button type="button" class="btn-secondary" id="refresh-history">Verlauf prüfen</button> <button type="button" class="icon-btn" id="dismiss-error" aria-label="Hinweis schließen">×</button></div>` : ""}
-        ${noAgent ? `<div class="notice">Der Chat ist für deinen Zugang noch nicht eingerichtet. Bitte kontaktiere deinen Dienstleister.</div>` : ""}
-        ${this._quotaNoticeHtml()}
-        ${this._topupHtml()}
         <div class="body">
           ${this._sidebarHtml()}
           <div class="main">
-            <div class="conversation-head"><strong>${this._esc(this._conversation?.title || "Neue Unterhaltung")}</strong>${this._conversation ? `<button type="button" class="icon-btn" id="conversation-menu" aria-label="Unterhaltungsaktionen" aria-expanded="${this._menuOpen}">⋯</button>` : ""}</div>
+            ${this._detailsOpen || this._topupOpen ? `<div class="inspector">${this._detailsOpen ? `<section class="chat-details" aria-label="Chat-Details"><div class="details-head"><strong>Chat-Details</strong><button type="button" class="icon-btn" id="details-close" aria-label="Chat-Details schließen">×</button></div>${this._modelHtml()}${quotaInfo}${this._quotaHtml()}${this._usageHtml()}${this._quotaNoticeHtml()}<p class="details-note">Kontext und Token-Budget sind getrennte Grenzen. Ein neuer Chat startet ohne bisherigen Verlauf. Das Token-Budget und die KI-Werkzeugaufrufe werden vom Support-Backend gesteuert.</p></section>` : this._topupHtml()}</div>` : ""}
             ${this._menuOpen && this._conversation ? `<div class="conversation-actions"><button type="button" class="btn-secondary" id="rename">Umbenennen</button><button type="button" class="btn-secondary" id="reuse">Letzte Frage bearbeiten</button><button type="button" class="btn-secondary" id="del">Unterhaltung löschen</button></div>` : ""}
             <div class="messages-wrap">
               <div class="messages" id="messages" role="region" aria-label="Chatverlauf" tabindex="0">
@@ -2012,6 +2075,9 @@ class AllroggenChatPanel extends HTMLElement {
               </div>
               ${this._unseenBelow ? `<button type="button" class="new-msgs" id="new-msgs">↓ Neue Nachrichten</button>` : ""}
             </div>
+            <div class="composer-shell">
+            ${this._error ? `<div class="error-banner" role="alert">${this._esc(this._error)} <button type="button" class="text-btn" id="refresh-history">Verlauf prüfen</button> <button type="button" class="text-btn" id="dismiss-error" aria-label="Hinweis schließen">Schließen</button></div>` : ""}
+            ${noAgent ? `<p class="details-note">Der Chat ist für deinen Zugang noch nicht eingerichtet. Bitte kontaktiere deinen Dienstleister.</p>` : ""}
             ${this._pendingImage ? `
               <div class="img-preview">
                 <img src="${this._esc(this._pendingImage.previewUrl)}" alt="${this._esc(this._pendingImage.fileName)}" />
@@ -2021,24 +2087,40 @@ class AllroggenChatPanel extends HTMLElement {
             ${this._speechError ? `<div class="speech-error">${this._esc(this._speechError)}</div>` : ""}
             <div class="composer">
               <input type="file" id="imgfile" accept="image/*" hidden />
+              <textarea id="msg" rows="1" aria-label="Nachricht" aria-describedby="composer-hint" placeholder="${quotaExceeded ? "Kontingent erreicht – siehe Chat-Details" : "Frage etwas oder beschreibe eine Aufgabe…"}" ${inputDisabled ? "disabled" : ""}></textarea>
+              <div class="composer-toolbar">
+              <span class="composer-mode">Support · Home Assistant</span>
               <button type="button" class="icon-btn" id="attach" title="Bild anhängen" ${inputDisabled ? "disabled" : ""}>${ICON_PAPERCLIP}</button>
               ${this._speechSupported() ? `<button type="button" class="icon-btn ${this._recording ? "recording" : ""}" id="mic" title="Spracheingabe" ${inputDisabled ? "disabled" : ""}>${ICON_MIC}</button>` : ""}
-              <textarea id="msg" rows="1" aria-label="Nachricht" aria-describedby="composer-hint" placeholder="Nachricht schreiben…" ${inputDisabled ? "disabled" : ""}></textarea>
               ${this._busy && this._busyConversationId != null
                 ? `<button type="button" class="cancel-btn" id="cancel" ${this._cancelling ? "disabled" : ""}>Abbrechen</button>`
                 : `<button type="button" class="send-btn" id="send" title="Senden" ${inputDisabled ? "disabled" : ""}>${ICON_SEND}</button>`}
+              </div>
             </div>
-            <div class="composer-hint" id="composer-hint">Enter sendet · Umschalt + Enter für eine neue Zeile</div>
+            <div class="composer-footer">
+              <div class="context-actions"><span id="context-status">${this._contextHtml()}</span><button type="button" class="text-btn" id="fresh-chat" title="Leeren Chat ohne bisherigen Verlauf öffnen. Vorhandene Unterhaltungen und HA-Änderungen bleiben erhalten.">${ICON_PLUS} Neuer Chat</button>${quotaExceeded ? `<button type="button" class="text-btn" id="quota-details">Kontingent ansehen</button>` : ""}</div>
+              <div class="composer-hint" id="composer-hint">Enter senden · ⇧ Enter neue Zeile</div>
+            </div>
+            </div>
           </div>
         </div>
       </div>
     `;
 
     const send = this.shadowRoot.getElementById("send");
+    this.shadowRoot.querySelector(".wrap").addEventListener("click", (event) => {
+      if (!(this._menuOpen || this._detailsOpen || this._topupOpen)) return;
+      if (event.target.closest(".inspector, .conversation-actions, #conversation-menu, #details-toggle, #topup-toggle, #quota-details")) return;
+      this._menuOpen = false;
+      this._detailsOpen = false;
+      this._topupClose();
+    });
     this.shadowRoot.querySelector(".wrap").addEventListener("keydown", (event) => {
-      if (event.key === "Escape" && (this._drawerOpen || this._menuOpen)) {
-        this._drawerOpen = false; this._menuOpen = false; this._render();
-        this.shadowRoot.getElementById("conv-toggle").focus();
+      if (event.key === "Escape" && (this._drawerOpen || this._menuOpen || this._detailsOpen || this._topupOpen)) {
+        const focusId = this._drawerOpen ? "conv-toggle" : this._menuOpen ? "conversation-menu" : this._detailsOpen ? "details-toggle" : "topup-toggle";
+        this._drawerOpen = false; this._menuOpen = false; this._detailsOpen = false;
+        this._topupClose();
+        this.shadowRoot.getElementById(focusId)?.focus();
       }
     });
     if (send) send.addEventListener("click", () => this._send());
@@ -2058,7 +2140,10 @@ class AllroggenChatPanel extends HTMLElement {
     const topupToggle = this.shadowRoot.getElementById("topup-toggle");
     if (topupToggle) topupToggle.addEventListener("click", () => {
       this._topupOpen = !this._topupOpen;
+      this._detailsOpen = false;
+      this._menuOpen = false;
       this._render();
+      this.shadowRoot.getElementById(this._topupOpen ? "topup-x" : "topup-toggle")?.focus();
     });
     const topupX = this.shadowRoot.getElementById("topup-x");
     if (topupX) topupX.addEventListener("click", (e) => { e.stopPropagation(); this._topupClose(); });
@@ -2089,8 +2174,11 @@ class AllroggenChatPanel extends HTMLElement {
     }
     for (const el of this.shadowRoot.querySelectorAll("details[data-state-key]")) el.open = openDetails.includes(el.dataset.stateKey);
     if (!hadFocus && activeId) this.shadowRoot.getElementById(activeId)?.focus({ preventScroll: true });
-    this.shadowRoot.getElementById("details-toggle").addEventListener("click", () => { this._detailsOpen = !this._detailsOpen; this._render(); });
-    this.shadowRoot.getElementById("conversation-menu")?.addEventListener("click", () => { this._menuOpen = !this._menuOpen; this._render(); });
+    const toggleDetails = () => { this._detailsOpen = !this._detailsOpen; this._topupOpen = false; this._menuOpen = false; this._render(); this.shadowRoot.getElementById(this._detailsOpen ? "details-close" : "details-toggle").focus(); };
+    this.shadowRoot.getElementById("details-toggle").addEventListener("click", toggleDetails);
+    this.shadowRoot.getElementById("details-close")?.addEventListener("click", () => { toggleDetails(); this.shadowRoot.getElementById("details-toggle").focus(); });
+    this.shadowRoot.getElementById("quota-details")?.addEventListener("click", () => { this._detailsOpen = true; this._topupOpen = false; this._menuOpen = false; this._render(); this.shadowRoot.getElementById("details-close").focus(); });
+    this.shadowRoot.getElementById("conversation-menu")?.addEventListener("click", () => { this._menuOpen = !this._menuOpen; this._detailsOpen = false; this._topupOpen = false; this._render(); this.shadowRoot.getElementById(this._menuOpen ? "rename" : "conversation-menu").focus(); });
     this.shadowRoot.getElementById("rename")?.addEventListener("click", () => this._renameConversation());
     this.shadowRoot.getElementById("reuse")?.addEventListener("click", () => this._reuseQuestion());
     this.shadowRoot.getElementById("dismiss-error")?.addEventListener("click", () => { this._error = null; this._render(); });
@@ -2101,7 +2189,9 @@ class AllroggenChatPanel extends HTMLElement {
       const start = search.selectionStart;
       this._render();
       const next = this.shadowRoot.getElementById("conv-search");
-      next.focus(); next.setSelectionRange(start, start);
+      next.focus();
+      // type=search unterstützt setSelectionRange nicht in jedem Browser.
+      try { next.setSelectionRange(start, start); } catch (_) { /* Suchfokus bleibt erhalten. */ }
     });
     for (const suggestion of this.shadowRoot.querySelectorAll(".suggestion")) suggestion.addEventListener("click", () => {
       if (msgInput.disabled) return;
@@ -2123,6 +2213,7 @@ class AllroggenChatPanel extends HTMLElement {
     });
     this.shadowRoot.getElementById("conv-toggle").addEventListener("click", () => this._toggleSidebar());
     this.shadowRoot.getElementById("new").addEventListener("click", () => this._newConversation());
+    this.shadowRoot.getElementById("fresh-chat").addEventListener("click", () => { this._newConversation(); this.shadowRoot.getElementById("msg").focus(); });
     for (const card of this.shadowRoot.querySelectorAll(".conv-card[data-conv-id]")) {
       card.addEventListener("click", () => this._selectConversation(Number(card.dataset.convId)));
     }

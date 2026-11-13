@@ -4,28 +4,53 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Support-Chat · lokale UI-Testdaten</title>
 <style>
-  :root { color-scheme: dark; --header-height: 0px; --primary-color: #ffa000; --primary-text-color: #e8eaed; --secondary-text-color: #b1b5bd; --card-background-color: #202124; --secondary-background-color: #303238; --divider-color: #484b52; --error-color: #ef7770; }
-  body { margin: 0; background: #282a2d; color: var(--primary-text-color); font: 15px system-ui, sans-serif; }
+  :root { color-scheme: dark; --header-height: 0px; --primary-color: #a0a0a0; --primary-text-color: #e4e4e7; --secondary-text-color: #9b9b9f; --primary-background-color: #141414; --card-background-color: #1c1c1c; --secondary-background-color: #292929; --divider-color: #333; --error-color: #ef7770; }
+  :root.light { color-scheme: light; --primary-color: #555; --primary-text-color: #27272a; --secondary-text-color: #646469; --primary-background-color: #fafafa; --card-background-color: #fff; --secondary-background-color: #eee; --divider-color: #ddd; --error-color: #bc3c35; }
+  body { margin: 0; background: var(--primary-background-color); color: var(--primary-text-color); font: 14px system-ui, sans-serif; }
 </style>
 <allroggen-chat-panel></allroggen-chat-panel>
 <script type="module">
   import "../custom_components/allroggen_chat/panel/allroggen-chat-panel.js";
+  const params = new URLSearchParams(location.search);
+  if (params.has("light")) document.documentElement.classList.add("light");
   const panel = document.querySelector("allroggen-chat-panel");
   panel._hass = { auth: { data: { access_token: "local-fixture" } } };
-  panel._config = { enabled: true, assistantName: "Allroggen Support", modelName: "oh-orchestrator", providerName: "Omni-Route-Burg", quota: { includedMonthlyEur: 0, includedRemainingEur: 0, creditRemainingEur: 21.79, costLimit: 0, currency: "EUR", resetsAt: "2026-11-01" } };
+  panel._config = { enabled: true, assistantName: "Allroggen Support", modelName: "Support-Agent", contextWindowTokens: 200000, quota: { includedMonthlyEur: 5, includedRemainingEur: 2, creditRemainingEur: 0, costLimit: 5, currency: "EUR", resetsAt: "2026-12-01" } };
   panel._sseOk = true;
-  panel._conversation = { id: 1, title: "Flurlicht am Morgen", usage: { totalTokens: 69242 }, messages: [
-    { id: 1, role: "assistant", content: "Ich habe diese Automationen gefunden:\n\n1. **Flur Licht Bewegung Nacht** – aktiv\n2. **Flur Licht Sonnenaufgang** – ausgeschaltet\n3. **Flur Licht Nachtlicht** – aktiv\n\nWelche möchtest du anpassen?", sentAt: "2026-10-20T10:15:00Z" },
-    { id: 2, role: "user", content: "Das Licht, das morgens um 5 Uhr angeht.", sentAt: "2026-10-20T10:17:00Z" },
-    { id: 3, role: "error", content: "HTTP 503 (service_unavailable: ALL_TARGETS_SKIPPED)\n\nService temporarily unavailable: all targets were skipped by pre-dispatch filters", sentAt: "2026-10-20T10:17:01Z" }
+  panel._conversation = { id: 1, title: "Flurlicht am Morgen", usage: { totalTokens: 69242, lastInputTokens: 24000 }, messages: [
+    { id: 1, role: "user", content: "Das Flurlicht geht jeden Morgen um 5 Uhr an. Kannst du nachschauen, welche Automation dafür verantwortlich ist?", sentAt: "2026-11-13T07:15:00Z" },
+    { id: 2, role: "tool", content: 'ha_search({"query":"Flur","domain_filter":"automation","limit":10})', sentAt: "2026-11-13T07:15:01Z" },
+    { id: 3, role: "tool", content: 'ha_get_automation({"entity_id":"automation.flur_licht_morgen"})', sentAt: "2026-11-13T07:15:02Z" },
+    { id: 4, role: "assistant", content: "Ich habe die passende Automation gefunden: **Flur Licht Morgen**.\n\nSie schaltet das Licht täglich um **05:00 Uhr** ein – auch am Wochenende. Ein Bewegungssensor ist für diesen Auslöser nicht erforderlich.\n\nIch habe noch nichts verändert. Soll ich die Uhrzeit verschieben oder die Automation auf Werktage begrenzen?", sentAt: "2026-11-13T07:15:03Z" },
+    { id: 5, role: "user", content: "Bitte nur an Werktagen und erst um 6:30 Uhr.", sentAt: "2026-11-13T07:16:00Z" },
+    { id: 6, role: "assistant", content: "Alles klar. Ich passe den Auslöser auf **06:30 Uhr** an und ergänze eine Bedingung für **Montag bis Freitag**.\n\nDie übrigen Einstellungen bleiben unverändert.", sentAt: "2026-11-13T07:16:03Z" }
   ] };
-  panel._conversations = [{ id: 1, title: "Flurlicht am Morgen", updatedAt: "2026-10-20T10:17:01Z" }, { id: 2, title: "Heizung im Büro", updatedAt: "2026-10-19T08:00:00Z" }];
+  panel._conversations = [{ id: 1, title: "Flurlicht am Morgen", updatedAt: "2026-11-13T07:16:03Z" }, { id: 2, title: "Heizung im Büro", updatedAt: "2026-11-12T08:00:00Z" }, { id: 3, title: "Alexa & Tuya – Lichtgruppe", updatedAt: "2026-11-11T16:20:00Z" }, { id: 4, title: "Dashboard fürs Wohnzimmer", updatedAt: "2026-11-10T18:45:00Z" }];
+  if (params.get("scenario") === "limit") {
+    panel._config.quota.exceeded = true;
+    panel._config.quota.includedRemainingEur = 0;
+    panel._conversation.messages.push({ id: 7, role: "error", content: "Token-Budget erreicht (558085/500000 Tokens).", sentAt: "2026-11-13T07:17:00Z" });
+    panel._conversation.usage.lastInputTokens = 180000;
+  }
+  const sample = structuredClone(panel._conversation);
+  if (params.get("scenario") === "empty") panel._conversation = null;
+  // Ausschließlich synthetische Daten, keine HA-/Backend-Verbindung.
   panel._api = async (method, path, body) => {
     if (path === "conversations") return panel._conversations;
     if (path.endsWith("/rename")) return null;
     if (path === "config") return panel._config;
-    if (method === "GET") return { ...panel._conversation, id: Number(path.split("/")[1]) };
+    if (method === "GET") {
+      const id = Number(path.split("/")[1]);
+      return { ...structuredClone(sample), id, title: panel._conversations.find((c) => c.id === id)?.title || "Vorschau" };
+    }
     throw { status: 503 };
+  };
+  const render = panel._render.bind(panel);
+  panel._render = () => {
+    render();
+    // In der Wegwerf-Vorschau existiert HAs registrierter Static-Pfad nicht.
+    const avatar = panel.shadowRoot.getElementById("avatar-img");
+    if (avatar) avatar.src = "../custom_components/allroggen_chat/panel/logo.svg";
   };
   new ResizeObserver(([entry]) => { panel._narrow = entry.contentRect.width < 640; panel._render(); }).observe(panel);
   panel._render();
